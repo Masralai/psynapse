@@ -8,6 +8,7 @@ const repo = new NodeRepo();
 export const nodeService = {
   createNode: (userId: string, name: string) => repo.createNode(userId, name),
   listNodes: (userId: string) => repo.listNodes(userId),
+  listNodesWithStats: (userId: string) => repo.listNodesWithStats(userId),
   getNode: (id: string) => repo.getNode(id),
   assertNodeOwner: (nodeId: string, userId: string) => repo.assertNodeOwner(nodeId, userId),
   renameNode: (id: string, name: string) => repo.renameNode(id, name),

@@ -29,6 +29,26 @@ export class NodeRepo {
     return db.select().from(nodes).where(eq(nodes.userId, userId));
   }
 
+  // ponytail: single join-group, paginate at 50 if needed
+  async listNodesWithStats(userId: string): Promise<(Node & { sourceCount: number; readyCount: number })[]> {
+    const rows = await db
+      .select({
+        id: nodes.id,
+        userId: nodes.userId,
+        name: nodes.name,
+        createdAt: nodes.createdAt,
+        updatedAt: nodes.updatedAt,
+        sourceCount: sql<number>`count(${sources.id})`.mapWith(Number),
+        readyCount: sql<number>`count(*) filter (where ${sources.status} = 'ready')`.mapWith(Number),
+      })
+      .from(nodes)
+      .leftJoin(sources, eq(sources.nodeId, nodes.id))
+      .where(eq(nodes.userId, userId))
+      .groupBy(nodes.id)
+      .orderBy(desc(nodes.updatedAt));
+    return rows as any;
+  }
+
   async getNode(id: string): Promise<Node | null> {
     const [n] = await db.select().from(nodes).where(eq(nodes.id, id));
     return n ?? null;

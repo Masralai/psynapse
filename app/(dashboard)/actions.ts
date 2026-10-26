@@ -18,6 +18,11 @@ export async function listNodes() {
   return nodeService.listNodes(userId);
 }
 
+export async function listNodesWithStats() {
+  const { userId } = await requireAuth();
+  return nodeService.listNodesWithStats(userId);
+}
+
 export async function renameNode(id: string, name: string) {
   const { userId } = await requireAuth();
   await nodeService.assertNodeOwner(id, userId);
