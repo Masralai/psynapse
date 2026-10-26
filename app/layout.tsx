@@ -9,7 +9,7 @@ import "./globals.css";
 const ptSerif = PT_Serif({
   subsets: ["latin"],
   variable: "--font-pt-serif",
-  weight: ["400"],
+  weight: ["400", "700"],
 });
 
 const jetbrainsMono = JetBrains_Mono({

@@ -7,7 +7,7 @@ import { Footer } from "./_components/landing/footer";
 export default async function LandingPage() {
   return (
     <>
-      <div className="grain" />
+      <div className="grain grain-lux" />
       <main className="min-h-screen bg-black text-white">
         <Hero />
         <Features />

@@ -15,18 +15,10 @@ function Progress({ value, max = 100, indeterminate, className, label }: Progres
 
   return (
     <div className={cn("space-y-1", className)}>
-      <div className="h-[3px] bg-surface-border overflow-hidden">
-        <div
-          className={cn(
-            "h-full bg-accent-brand transition-all duration-500",
-            indeterminate && "w-1/3 animate-pulse",
-          )}
-          style={indeterminate && !value ? {} : { width: `${pct}%` }}
-        />
+      <div className="h-1 bg-white/5 overflow-hidden border border-white/5">
+        <div className={cn("h-full bg-accent-brand transition-all duration-500", indeterminate && "w-1/3 animate-[shimmer_1.2s_ease-in-out_infinite]")} style={indeterminate && !value ? {} : { width: `${pct}%` }} />
       </div>
-      {label && (
-        <p className="text-[10px] text-text-muted">{label}</p>
-      )}
+      {label && <p className="text-[10px] tracking-[0.08em] font-mono text-champagne/60">{label}</p>}
     </div>
   )
 }

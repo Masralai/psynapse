@@ -25,7 +25,7 @@ const iconMap: Record<string, LucideIcon> = {
 
 export function SourceIcon({ type, size = 14 }: { type: string; size?: number }) {
   const Icon = iconMap[type] || FileIcon;
-  return <Icon size={size} className="text-text-muted shrink-0" />;
+  return <Icon size={size} className="text-champagne/70 shrink-0" />;
 }
 
 export function getSourceIcon(type: string): LucideIcon {

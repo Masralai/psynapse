@@ -35,12 +35,10 @@ export function NodeCreateDialog({ open, onOpenChange, onConfirm }: NodeCreateDi
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="bg-surface-subtle border-surface-border text-white">
+      <DialogContent className="bg-[#0a0a0a] border-champagne/10 text-white">
         <DialogHeader>
-          <DialogTitle className="text-sm text-text-outlined">Create node</DialogTitle>
-          <DialogDescription className="text-xs text-text-muted mt-2">
-            Give your knowledge node a name to get started.
-          </DialogDescription>
+          <DialogTitle className="font-serif text-sm text-white">Create node</DialogTitle>
+          <DialogDescription className="text-xs text-text-muted mt-2">Give your knowledge node a name to get started.</DialogDescription>
         </DialogHeader>
         <div className="mt-2">
           <input

@@ -1,16 +1,11 @@
 import type { Config } from "tailwindcss";
 
 const config: Config = {
-  content: [
-    "./pages/**/*.{js,ts,jsx,tsx,mdx}",
-    "./components/**/*.{js,ts,jsx,tsx,mdx}",
-    "./app/**/*.{js,ts,jsx,tsx,mdx}",
-  ],
+  content: ["./pages/**/*.{js,ts,jsx,tsx,mdx}", "./components/**/*.{js,ts,jsx,tsx,mdx}", "./app/**/*.{js,ts,jsx,tsx,mdx}"],
   darkMode: "class",
   theme: {
     extend: {
       colors: {
-        /* Shadcn semantic tokens */
         background: "hsl(var(--background))",
         foreground: "hsl(var(--foreground))",
         card: "hsl(var(--card))",
@@ -31,22 +26,27 @@ const config: Config = {
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
 
-        /* DESIGN.md Surfaces */
         "surface-deep": "#000000",
         "surface-subtle": "#060606",
         "surface-card": "#1f1f1f",
+        "surface-card-hover": "#262626",
         "surface-border": "#252525",
         "surface-elevated": "#313131",
+        "surface-vitrine": "rgba(31,31,31,0.72)",
 
-        /* DESIGN.md Text colors */
         "text-outlined": "#c5c5c5",
         "text-muted": "#7a7a7a",
         "text-faint": "#3d3d3d",
+        "text-ivory": "#faf9f6",
 
-        /* DESIGN.md Accents (emerald replacing lime) */
         "accent-brand": "#10b981",
-        "accent-glow": "rgba(16, 185, 129, 0.2)",
-        "accent-muted": "rgba(16, 185, 129, 0.1)",
+        "accent-jewel": "#065f46",
+        "accent-deep": "#022c22",
+        "accent-highlight": "#6ee7b7",
+        "accent-glow": "rgba(16, 185, 129, 0.14)",
+        "accent-muted": "rgba(16, 185, 129, 0.07)",
+        "champagne": "#c9a86a",
+        "champagne-soft": "rgba(201,168,106,0.14)",
       },
       fontFamily: {
         sans: ["var(--font-geist-sans)", "Geist", "system-ui", "sans-serif"],
@@ -62,41 +62,28 @@ const config: Config = {
         "heading-lg": ["72px", { lineHeight: "1", letterSpacing: "-0.02px" }],
         display: ["130px", { lineHeight: "0.88", letterSpacing: "-0.035px" }],
       },
-      spacing: {
-        "6": "6px",
-        "7": "7px",
-        "10": "10px",
-        "14": "14px",
-        "18": "18px",
-        "22": "22px",
-        "30": "30px",
-        "44": "44px",
-      },
+      spacing: { "6": "6px", "7": "7px", "10": "10px", "14": "14px", "18": "18px", "22": "22px", "30": "30px", "44": "44px" },
       boxShadow: {
-        sm: "rgba(16, 185, 129, 0.45) 0px 0px 8px 0px",
-        md: "rgba(0, 0, 0, 0.3) 0px 4px 12px 0px",
-        lg: "rgba(0, 0, 0, 0.4) 0px 8px 24px 0px",
+        sm: "0 0 0 1px rgba(201,168,106,0.06), 0 4px 16px rgba(0,0,0,0.45)",
+        vitrine: "inset 0 1px 0 rgba(201,168,106,0.07), 0 8px 32px rgba(0,0,0,0.6), 0 0 20px rgba(16,185,129,0.06)",
+        emerald: "0 0 18px rgba(16,185,129,0.22)",
+        md: "rgba(0, 0, 0, 0.35) 0px 6px 20px 0px",
+        lg: "rgba(0, 0, 0, 0.5) 0px 12px 40px 0px",
       },
       animation: {
-        "fade-in": "fadeIn 300ms ease-out",
-        "slide-up": "slideUp 300ms ease-out",
-        "scale-in": "scaleIn 200ms ease-out",
-        "breathe": "breathe 4s ease-in-out infinite",
-        "scanline": "scanline 8s linear infinite",
+        "fade-in": "fadeIn 320ms ease-out",
+        "slide-up": "slideUp 420ms cubic-bezier(0.25,0.1,0,1)",
+        "scale-in": "scaleIn 220ms ease-out",
+        breathe: "breathe 4.5s ease-in-out infinite",
+        shimmer: "shimmer 2.2s ease-in-out infinite",
+        foil: "foilShift 8s ease infinite",
+        scanline: "scanline 8s linear infinite",
       },
       keyframes: {
-        fadeIn: {
-          "0%": { opacity: "0" },
-          "100%": { opacity: "1" },
-        },
-        slideUp: {
-          "0%": { opacity: "0", transform: "translateY(10px)" },
-          "100%": { opacity: "1", transform: "translateY(0)" },
-        },
-        scaleIn: {
-          "0%": { opacity: "0", transform: "scale(0.95)" },
-          "100%": { opacity: "1", transform: "scale(1)" },
-        },
+        fadeIn: { "0%": { opacity: "0" }, "100%": { opacity: "1" } },
+        slideUp: { "0%": { opacity: "0", transform: "translateY(14px)" }, "100%": { opacity: "1", transform: "translateY(0)" } },
+        scaleIn: { "0%": { opacity: "0", transform: "scale(0.96)" }, "100%": { opacity: "1", transform: "scale(1)" } },
+        shimmer: { "0%": { transform: "translateX(-100%)" }, "100%": { transform: "translateX(100%)" } },
       },
     },
   },

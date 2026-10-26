@@ -49,12 +49,10 @@ export function UrlDialog({ open, onOpenChange, onConfirm }: UrlDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="bg-surface-subtle border-surface-border text-white">
+      <DialogContent className="bg-[#0a0a0a] border-champagne/10 text-white">
         <DialogHeader>
-          <DialogTitle className="text-sm text-text-outlined">Add URL</DialogTitle>
-          <DialogDescription className="text-xs text-text-muted mt-2">
-            Enter a web page URL or YouTube link to add as a source.
-          </DialogDescription>
+          <DialogTitle className="font-serif text-sm text-white">Add URL</DialogTitle>
+          <DialogDescription className="text-xs text-text-muted mt-2">Enter a web page URL or YouTube link to add as a source.</DialogDescription>
         </DialogHeader>
         <div className="relative mt-2">
           <Link size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
