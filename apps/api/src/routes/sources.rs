@@ -374,6 +374,12 @@ async fn create_source(
     mut multipart: Multipart,
 ) -> Result<Json<SourceDetailResponse>, AppError> {
     // ponytail: minimal multipart parser matching frontend form-data fields.
+    let max_upload = std::env::var("OPEN_NOTEBOOK_MAX_UPLOAD_SIZE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .map(|mb| (mb * 1024.0 * 1024.0) as usize)
+        .unwrap_or(100 * 1024 * 1024);
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
@@ -381,7 +387,14 @@ async fn create_source(
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
             file_name = field.file_name().map(|s| s.to_string());
-            file_bytes = Some(field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?.to_vec());
+            let bytes = field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+            if bytes.len() > max_upload {
+                return Err(AppError::Http(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Uploaded file exceeds maximum allowed size".into(),
+                ));
+            }
+            file_bytes = Some(bytes.to_vec());
         } else {
             let v = field.text().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
             fields.insert(name, v);

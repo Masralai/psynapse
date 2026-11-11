@@ -473,10 +473,13 @@ async fn process_source(pool: &PgPool, input: &Value) -> Result<Value, String> {
         full_text = None;
     }
 
+    let char_count = full_text.as_ref().map(|t| t.chars().count()).unwrap_or(0);
     let info = json!({
         "async": true,
         "completed": true,
         "note": note,
+        "char_count": char_count,
+        "has_full_text": full_text.is_some(),
         "completed_at": chrono::Utc::now().to_rfc3339()
     });
     let res = sqlx::query(
@@ -532,10 +535,25 @@ async fn process_source(pool: &PgPool, input: &Value) -> Result<Value, String> {
         "source_id": sid.to_string(),
         "status": "completed",
         "note": note,
+        "char_count": char_count,
         "has_full_text": full_text.is_some(),
         "embedded_chunks": embedded_chunks,
         "insights_created": insights_created
     }))
+}
+
+fn max_extract_bytes() -> usize {
+    // ponytail: simple cap for in-worker extraction; richer streaming/chunked extraction pending.
+    std::env::var("SOURCE_EXTRACT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10 * 1024 * 1024)
+}
+
+fn looks_like_html(s: &str) -> bool {
+    let t = s.trim_start().to_ascii_lowercase();
+    t.starts_with("<!doctype html") || t.starts_with("<html") || (t.contains("<body") && t.contains("</"))
 }
 
 async fn extract_content(cs: &Value) -> Result<(Option<String>, String, Option<String>), String> {
@@ -544,8 +562,12 @@ async fn extract_content(cs: &Value) -> Result<(Option<String>, String, Option<S
         .and_then(|v| v.as_str())
         .or_else(|| cs.get("text").and_then(|v| v.as_str()))
     {
-        let title = content.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().chars().take(80).collect());
-        return Ok((Some(content.to_string()), "text content stored".into(), title));
+        let title = content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().chars().take(80).collect());
+        let (text, note) = normalize_text_content(content, "direct", None);
+        return Ok((text, note, title));
     }
 
     if let Some(url) = cs.get("url").and_then(|v| v.as_str()) {
@@ -563,31 +585,123 @@ async fn extract_content(cs: &Value) -> Result<(Option<String>, String, Option<S
     Ok((None, "no extractable content in this pass".into(), None))
 }
 
+fn normalize_text_content(raw: &str, source_kind: &str, ext_hint: Option<&str>) -> (Option<String>, String) {
+    let mut text = raw.to_string();
+    let mut notes: Vec<String> = vec![format!("{source_kind} content extracted")];
+    let ext = ext_hint.unwrap_or("").to_ascii_lowercase();
+    if matches!(ext.as_str(), "html" | "htm") || looks_like_html(&text) {
+        let stripped = html_to_text(&text);
+        if !stripped.trim().is_empty() {
+            text = stripped;
+            notes.push("html stripped to text".into());
+        }
+    }
+    let max = max_extract_bytes();
+    if text.len() > max {
+        let mut cut = max.min(text.len());
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        notes.push(format!("truncated to {cut} bytes"));
+    }
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return (None, format!("{source_kind} extracted but empty"));
+    }
+    (Some(trimmed), notes.join("; "))
+}
+
 async fn fetch_url_text(url: &str) -> Result<(Option<String>, String, Option<String>), String> {
-    // ponytail: basic fetch + naive HTML-to-text; richer extraction/rendered content deferred.
+    // ponytail: basic fetch + content-type-aware text/HTML extraction with size cap; richer extraction/rendered content deferred.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("psynapse-api/0.1")
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| format!("url fetch failed: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("url fetch failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("url fetch failed: status {}", resp.status()));
     }
-    let body = resp.text().await.map_err(|e| format!("url read failed: {e}"))?;
+    let max = max_extract_bytes();
+    if let Some(len) = resp.content_length() {
+        if len as usize > max.saturating_mul(4) {
+            return Ok((
+                None,
+                format!("url content too large to extract ({} bytes)", len),
+                Some(url.to_string()),
+            ));
+        }
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("url read failed: {e}"))?;
+    let mut truncated = false;
+    let mut data = bytes.to_vec();
+    if data.len() > max {
+        data.truncate(max);
+        truncated = true;
+    }
+    let body = String::from_utf8_lossy(&data).to_string();
     let title = extract_html_title(&body).or_else(|| Some(url.to_string()));
-    let text = html_to_text(&body);
-    if text.trim().is_empty() {
+
+    let is_textual = content_type.is_empty()
+        || content_type.starts_with("text/")
+        || content_type.contains("json")
+        || content_type.contains("xml")
+        || content_type.contains("javascript")
+        || content_type.contains("html");
+    if !is_textual {
+        return Ok((
+            None,
+            format!("url content-type not text-extractable ({content_type})"),
+            title,
+        ));
+    }
+
+    let mut text = body;
+    let mut notes = vec!["url content fetched".to_string()];
+    if content_type.contains("html") || looks_like_html(&text) {
+        let stripped = html_to_text(&text);
+        if !stripped.trim().is_empty() {
+            text = stripped;
+            notes.push("html stripped to text".into());
+        }
+    }
+    if truncated {
+        notes.push("truncated during fetch".into());
+    }
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
         return Ok((None, "url fetched but no text extracted".into(), title));
     }
-    Ok((Some(text), "url content fetched".into(), title))
+    Ok((Some(trimmed), notes.join("; "), title))
 }
 
 fn extract_html_title(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let start = lower.find("<title>")? + 7;
     let end = lower[start..].find("</title>")? + start;
-    let t = html[start..end].trim();
-    if t.is_empty() { None } else { Some(t.chars().take(120).collect()) }
+    let raw = &html[start..end];
+    let t = html_to_text(raw);
+    let t = t.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.chars().take(120).collect())
+    }
 }
 
 fn html_to_text(html: &str) -> String {
@@ -597,22 +711,46 @@ fn html_to_text(html: &str) -> String {
     let mut tag = String::new();
     for ch in html.chars() {
         match ch {
-            '<' => { in_tag = true; tag.clear(); }
+            '<' => {
+                in_tag = true;
+                tag.clear();
+            }
             '>' => {
                 in_tag = false;
                 let t = tag.to_ascii_lowercase();
-                if t.starts_with("script") || t.starts_with("style") { skip = true; }
-                if t.starts_with("/script") || t.starts_with("/style") { skip = false; }
-                if matches!(t.as_str(), "br" | "br/" | "p" | "/p" | "div" | "/div" | "li" | "/li" | "tr" | "/tr" | "h1" | "/h1" | "h2" | "/h2" | "h3" | "/h3") {
+                if t.starts_with("script") || t.starts_with("style") || t.starts_with("noscript") {
+                    skip = true;
+                }
+                if t.starts_with("/script") || t.starts_with("/style") || t.starts_with("/noscript") {
+                    skip = false;
+                }
+                if matches!(
+                    t.as_str(),
+                    "br" | "br/" | "p" | "/p" | "div" | "/div" | "li" | "/li" | "tr" | "/tr"
+                        | "h1" | "/h1" | "h2" | "/h2" | "h3" | "/h3" | "h4" | "/h4"
+                        | "h5" | "/h5" | "h6" | "/h6" | "section" | "/section"
+                        | "article" | "/article"
+                ) {
                     out.push('\n');
                 }
             }
-            _ if in_tag => { if tag.len() < 20 { tag.push(ch); } }
+            _ if in_tag => {
+                if tag.len() < 24 {
+                    tag.push(ch);
+                }
+            }
             _ if !skip => out.push(ch),
             _ => {}
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    let normalized = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option<String>), String> {
@@ -620,15 +758,73 @@ async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option
     if !p.exists() {
         return Err("uploaded file not found".into());
     }
+    let meta = tokio::fs::metadata(p)
+        .await
+        .map_err(|e| format!("file stat failed: {e}"))?;
     let title = p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-    let likely_text = matches!(ext.as_str(), "txt"|"md"|"markdown"|"csv"|"json"|"xml"|"html"|"htm"|"yaml"|"yml"|"log"|"rs"|"py"|"js"|"ts"|"tsx"|"jsx"|"go"|"java"|"c"|"cpp"|"h"|"toml");
-    let bytes = tokio::fs::read(p).await.map_err(|e| format!("file read failed: {e}"))?;
-    match String::from_utf8(bytes) {
-        Ok(text) if likely_text || !text.trim().is_empty() => Ok((Some(text), "file text extracted".into(), title)),
-        Ok(text) if text.trim().is_empty() => Ok((None, "file extracted but empty".into(), title)),
-        Ok(text) => Ok((Some(text), "file decoded as text".into(), title)),
-        Err(_) => Ok((None, format!("binary/{ext} extraction pending pipeline"), title)),
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let max = max_extract_bytes();
+    if meta.len() as usize > max.saturating_mul(4) {
+        return Ok((
+            None,
+            format!("file too large to extract ({} bytes)", meta.len()),
+            title,
+        ));
+    }
+
+    let likely_text = matches!(
+        ext.as_str(),
+        "txt"|"md"|"markdown"|"csv"|"json"|"xml"|"html"|"htm"|"yaml"|"yml"|"log"|"rs"|"py"|"js"|"ts"|"tsx"|"jsx"|"go"|"java"|"c"|"cpp"|"h"|"toml"|"css"|"scss"|"sql"|"sh"|"env"|"ini"|"conf"
+    );
+    let bytes = tokio::fs::read(p)
+        .await
+        .map_err(|e| format!("file read failed: {e}"))?;
+    let mut data = bytes;
+    let mut truncated = false;
+    if data.len() > max {
+        data.truncate(max);
+        truncated = true;
+    }
+
+    match String::from_utf8(data) {
+        Ok(text) => {
+            if !likely_text && text.trim().is_empty() {
+                return Ok((None, "file extracted but empty".into(), title));
+            }
+            let (normalized, mut note) = normalize_text_content(&text, "file", Some(&ext));
+            if truncated {
+                note = format!("{note}; truncated during read");
+            }
+            if normalized.is_none() {
+                return Ok((
+                    None,
+                    if truncated {
+                        "file extracted but empty after truncation".into()
+                    } else {
+                        "file extracted but empty".into()
+                    },
+                    title,
+                ));
+            }
+            Ok((
+                normalized,
+                if likely_text {
+                    note
+                } else {
+                    format!("{note}; decoded as text")
+                },
+                title,
+            ))
+        }
+        Err(_) => Ok((
+            None,
+            format!("binary/{ext} extraction pending pipeline"),
+            title,
+        )),
     }
 }
 

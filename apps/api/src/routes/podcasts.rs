@@ -247,13 +247,17 @@ async fn stream_episode_audio(
         let p = PathBuf::from(&af);
         if p.is_absolute() { p } else { podcasts_dir().join(&af) }
     };
-    if !path.exists() { return Err(AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into())); }
-    // ponytail: basic containment/serving; strict containment parity pending.
+    let root = podcasts_dir().canonicalize().unwrap_or_else(|_| podcasts_dir());
+    let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if !canon.starts_with(&root) || !path.exists() {
+        return Err(AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into()));
+    }
+    // ponytail: containment check + basic serving; full range/streaming parity pending.
     if req.method() == Method::HEAD {
         return Ok(Response::builder().status(StatusCode::OK).body(Body::empty()).unwrap());
     }
     let bytes = tokio::fs::read(&path).await.map_err(|_| AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into()))?;
-    let ct = if af.ends_with(".wav") { "audio/wav" } else { "audio/mpeg" };
+    let ct = if af.to_ascii_lowercase().ends_with(".wav") { "audio/wav" } else { "audio/mpeg" };
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct)
