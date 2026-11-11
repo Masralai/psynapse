@@ -4,16 +4,19 @@ pub mod commands;
 pub mod config;
 pub mod credentials;
 pub mod embedding;
+pub mod episode_profiles;
 pub mod health;
 pub mod insights;
 pub mod models;
 pub mod notebooks;
 pub mod notes;
+pub mod podcasts;
 pub mod providers;
 pub mod search;
 pub mod settings;
 pub mod source_chat;
 pub mod sources;
+pub mod speaker_profiles;
 pub mod transformations;
 
 use crate::state::AppState;
@@ -39,7 +42,10 @@ pub fn api_routes(state: AppState) -> Router {
                 .merge(credentials::routes())
                 .merge(providers::routes())
                 .merge(embedding::routes())
-                .merge(insights::routes()),
+                .merge(insights::routes())
+                .merge(episode_profiles::routes())
+                .merge(speaker_profiles::routes())
+                .merge(podcasts::routes()),
         )
         .with_state(state)
 }
