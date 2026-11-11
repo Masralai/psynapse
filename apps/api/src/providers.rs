@@ -220,7 +220,13 @@ async fn resolve_model(
     if mtype != expected_type {
         return Err(AppError::BadRequest(format!("Selected model is not a {expected_type} model")));
     }
-    let cred_config: Option<Value> = row.try_get("cred_config").ok().flatten();
+    let cred_config_raw: Option<Value> = row.try_get("cred_config").ok().flatten();
+    let cred_config = match cred_config_raw {
+        Some(v) => Some(crate::crypto::decrypt_config(&v).map_err(|e| {
+            AppError::BadRequest(format!("Credential decryption failed: {e}"))
+        })?),
+        None => None,
+    };
 
     let (api_key, base_url) = resolve_provider_config(&provider, cred_config.as_ref());
     let base_url = base_url.ok_or_else(|| {

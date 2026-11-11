@@ -28,7 +28,7 @@ pub async fn enqueue(
 pub async fn status_payload(pool: &PgPool, job_id: Uuid) -> Result<Value, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, status, result, error_message, created_at, started_at, completed_at
+        SELECT id, app_name, command_name, status, result, error_message, retry_count, max_retries, created_at, started_at, completed_at
         FROM jobs WHERE id = $1
         "#,
     )
@@ -49,9 +49,13 @@ pub async fn status_payload(pool: &PgPool, job_id: Uuid) -> Result<Value, AppErr
 
     Ok(json!({
         "job_id": row.get::<Uuid, _>("id").to_string(),
+        "app_name": row.get::<String, _>("app_name"),
+        "command_name": row.get::<String, _>("command_name"),
         "status": status,
         "result": result,
         "error_message": error_message,
+        "retry_count": row.get::<i32, _>("retry_count"),
+        "max_retries": row.get::<i32, _>("max_retries"),
         "created": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
         "updated": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
             .unwrap_or_else(|| row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"))
@@ -65,14 +69,17 @@ pub fn as_command_id(job_id: Uuid) -> String {
 }
 
 // ponytail: single polling loop, SKIP LOCKED claim; handlers with partial provider/embedding execution.
-pub async fn run_worker(pool: PgPool) {
+// In-flight cancellation is cooperative/best-effort: completion/failure updates are conditional so canceled jobs are not overwritten.
+pub async fn run_worker(pool: PgPool, poll_interval_secs: u64, retry_backoff_secs: u64) {
+    let poll = Duration::from_secs(poll_interval_secs.max(1));
+    let backoff = Duration::from_secs(retry_backoff_secs.max(1));
     loop {
         match process_next(&pool).await {
             Ok(true) => {}
-            Ok(false) => tokio::time::sleep(Duration::from_secs(2)).await,
+            Ok(false) => tokio::time::sleep(poll).await,
             Err(e) => {
                 tracing::error!("job worker error: {e}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(backoff).await;
             }
         }
     }
@@ -106,13 +113,16 @@ async fn process_next(pool: &PgPool) -> Result<bool, sqlx::Error> {
 
     match dispatch(pool, &cmd, &input).await {
         Ok(result) => {
-            sqlx::query(
-                "UPDATE jobs SET status='completed', result=$2, error_message=NULL, completed_at=NOW() WHERE id=$1",
+            let updated = sqlx::query(
+                "UPDATE jobs SET status='completed', result=$2, error_message=NULL, completed_at=NOW() WHERE id=$1 AND status='running'",
             )
             .bind(id)
             .bind(result)
             .execute(pool)
             .await?;
+            if updated.rows_affected() == 0 {
+                tracing::info!("job {id} not marked completed (likely canceled/interrupted)");
+            }
         }
         Err(err) => {
             let row = sqlx::query(
@@ -123,16 +133,20 @@ async fn process_next(pool: &PgPool) -> Result<bool, sqlx::Error> {
                     status = CASE WHEN retry_count + 1 < max_retries THEN 'queued' ELSE 'failed' END,
                     completed_at = CASE WHEN retry_count + 1 < max_retries THEN NULL ELSE NOW() END,
                     started_at = CASE WHEN retry_count + 1 < max_retries THEN NULL ELSE started_at END
-                WHERE id = $1
+                WHERE id = $1 AND status = 'running'
                 RETURNING status
                 "#,
             )
             .bind(id)
             .bind(err.clone())
-            .fetch_one(pool)
+            .fetch_optional(pool)
             .await?;
-            let status: String = row.get("status");
-            touch_source_terminal(pool, &cmd, &input, &status, &err).await;
+            if let Some(row) = row {
+                let status: String = row.get("status");
+                touch_source_terminal(pool, &cmd, &input, &status, &err).await;
+            } else {
+                tracing::info!("job {id} not marked failed/requeued (likely canceled/interrupted)");
+            }
         }
     }
     Ok(true)
@@ -181,6 +195,7 @@ async fn dispatch(pool: &PgPool, command: &str, input: &Value) -> Result<Value, 
         "embed_note" => embed_note_job(pool, input).await,
         "rebuild_embeddings" => rebuild_embeddings_job(pool, input).await,
         "run_transformation" => run_transformation_job(pool, input).await,
+        "generate_podcast" => generate_podcast_job(pool, input).await,
         _ => Ok(json!({"skipped": true, "command": command})),
     }
 }
@@ -615,4 +630,113 @@ async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option
         Ok(text) => Ok((Some(text), "file decoded as text".into(), title)),
         Err(_) => Ok((None, format!("binary/{ext} extraction pending pipeline"), title)),
     }
+}
+
+async fn generate_podcast_job(pool: &PgPool, input: &Value) -> Result<Value, String> {
+    let eid = input
+        .get("episode_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| "missing episode_id".to_string())?;
+    let row = sqlx::query("SELECT name, briefing, content, episode_profile, speaker_profile FROM episodes WHERE id=$1")
+        .bind(eid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "episode not found".to_string())?;
+    let name: String = row.try_get("name").unwrap_or_else(|_| "Episode".into());
+    let mut content: String = row.try_get("content").unwrap_or_default();
+    let briefing: String = row.try_get("briefing").unwrap_or_default();
+    let ep_snap: Value = row.try_get("episode_profile").unwrap_or_else(|_| json!({}));
+
+    // ponytail: minimal content fallback from notebook sources when no direct content provided.
+    if content.trim().is_empty() {
+        if let Some(nb_str) = input.get("notebook_id").and_then(|v| v.as_str()) {
+            if let Ok(nid) = Uuid::parse_str(nb_str) {
+                let rows = sqlx::query(
+                    r#"SELECT coalesce(s.title,'Untitled source') as title, left(coalesce(s.full_text,''), 2000) as excerpt
+                       FROM sources s JOIN source_notebooks sn ON sn.source_id=s.id
+                       WHERE sn.notebook_id=$1 ORDER BY s.updated_at DESC LIMIT 5"#,
+                )
+                .bind(nid)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                let mut buf = String::new();
+                for r in rows {
+                    let t: String = r.try_get("title").unwrap_or_default();
+                    let ex: String = r.try_get("excerpt").unwrap_or_default();
+                    if !ex.trim().is_empty() { buf.push_str(&format!("\n## {t}\n{ex}\n")); }
+                }
+                content = buf;
+            }
+        }
+    }
+    if content.trim().is_empty() {
+        return Err("No content available for podcast generation".into());
+    }
+
+    let outline_model = ep_snap.get("outline_llm").and_then(|v| v.as_str()).map(str::to_string);
+    let transcript_model = ep_snap.get("transcript_llm").and_then(|v| v.as_str()).map(str::to_string)
+        .or_else(|| outline_model.clone());
+    let num_segments = ep_snap.get("num_segments").and_then(|v| v.as_i64()).unwrap_or(5);
+
+    let outline_system = "You create podcast outlines. Return valid JSON with key 'segments' (array of objects with 'title' and 'description').";
+    let outline_user = format!(
+        "Episode: {name}\nSegments: {num_segments}\nBriefing:\n{briefing}\n\nContent:\n{}",
+        content.chars().take(12000).collect::<String>()
+    );
+    let outline_text = crate::providers::chat_completion(pool, outline_model.as_deref(), Some("default_chat_model"), outline_system, &outline_user)
+        .await
+        .map_err(|e| e.to_string())?;
+    let outline_json: Value = serde_json::from_str(outline_text.trim())
+        .or_else(|_| extract_json_object(&outline_text))
+        .unwrap_or_else(|_| json!({"segments":[{"title": name, "description": outline_text}]}));
+
+    let transcript_system = "You write podcast transcripts. Return valid JSON with key 'transcript' (array of objects with 'speaker' and 'text').";
+    let transcript_user = format!(
+        "Episode: {name}\nBriefing:\n{briefing}\n\nOutline:\n{}\n\nContent:\n{}",
+        serde_json::to_string(&outline_json).unwrap_or_default(),
+        content.chars().take(10000).collect::<String>()
+    );
+    let transcript_text = crate::providers::chat_completion(pool, transcript_model.as_deref(), Some("default_chat_model"), transcript_system, &transcript_user)
+        .await
+        .map_err(|e| e.to_string())?;
+    let transcript_json: Value = serde_json::from_str(transcript_text.trim())
+        .or_else(|_| extract_json_object(&transcript_text))
+        .unwrap_or_else(|_| json!({"transcript":[{"speaker":"Host","text": transcript_text}]}));
+
+    // ponytail: TTS/audio synthesis pipeline not implemented; persist outline/transcript only.
+    let res = sqlx::query(
+        "UPDATE episodes SET outline=$1, transcript=$2, updated_at=NOW() WHERE id=$3",
+    )
+    .bind(&outline_json)
+    .bind(&transcript_json)
+    .bind(eid)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if res.rows_affected() == 0 {
+        return Err("episode not found".into());
+    }
+
+    Ok(json!({
+        "status":"completed",
+        "episode_id": eid.to_string(),
+        "outline_generated": true,
+        "transcript_generated": true,
+        "audio_generated": false,
+        "note": "Audio synthesis/TTS pending; outline and transcript generated."
+    }))
+}
+
+fn extract_json_object(s: &str) -> Result<Value, serde_json::Error> {
+    if let Some(start) = s.find('{') {
+        if let Some(end) = s.rfind('}') {
+            if end > start {
+                return serde_json::from_str(&s[start..=end]);
+            }
+        }
+    }
+    serde_json::from_str(s)
 }

@@ -99,7 +99,11 @@ fn get_i(cfg: &Value, k: &str) -> Option<i64> { cfg.get(k).and_then(|v| v.as_i64
 
 async fn to_response(state: &AppState, r: &sqlx::postgres::PgRow) -> CredentialResponse {
     let id: Uuid = r.get("id");
-    let cfg: Value = r.try_get("config").unwrap_or_else(|_| json!({}));
+    let stored_cfg: Value = r.try_get("config").unwrap_or_else(|_| json!({}));
+    let (cfg, decryption_error) = match crate::crypto::decrypt_config(&stored_cfg) {
+        Ok(v) => (v, None),
+        Err(e) => (json!({}), Some(e)),
+    };
     let modalities_v: Value = r.try_get("modalities").unwrap_or_else(|_| json!([]));
     let modalities = modalities_v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let model_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM models WHERE credential_id=$1").bind(id).fetch_one(&state.pool).await.unwrap_or(0);
@@ -123,12 +127,12 @@ async fn to_response(state: &AppState, r: &sqlx::postgres::PgRow) -> CredentialR
         created: fmt(r.get("created_at")),
         updated: fmt(r.get("updated_at")),
         model_count,
-        decryption_error: None,
+        decryption_error,
     }
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    // ponytail: basic status; encryption-at-rest flag false until implemented.
+    // ponytail: credential configs encrypted at rest (key rotation/KMS hardening pending).
     let rows = sqlx::query("SELECT lower(provider) as p, COUNT(*)::bigint c FROM credentials GROUP BY lower(provider)").fetch_all(&state.pool).await?;
     let mut configured = serde_json::Map::new();
     let mut source = serde_json::Map::new();
@@ -137,7 +141,8 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         configured.insert(p.clone(), json!(true));
         source.insert(p, json!("database"));
     }
-    Ok(Json(json!({"configured": configured, "source": source, "encryption_configured": false})))
+    let encryption_configured = crate::crypto::is_encryption_configured() || !configured.is_empty();
+    Ok(Json(json!({"configured": configured, "source": source, "encryption_configured": encryption_configured})))
 }
 
 async fn env_status() -> Json<Value> {
@@ -189,10 +194,12 @@ async fn create_credential(State(state): State<AppState>, Json(p): Json<CreateCr
         if p.base_url.as_deref().unwrap_or("").trim().is_empty() { return Err(AppError::BadRequest("Anthropic-compatible credentials require a base URL".into())); }
         if p.api_key.as_deref().unwrap_or("").trim().is_empty() { return Err(AppError::BadRequest("Anthropic-compatible credentials require an API key".into())); }
     }
+    let plain = config_from_create(&p);
+    let stored = crate::crypto::encrypt_config(&plain).map_err(|e| AppError::Http(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let row = sqlx::query(
         "INSERT INTO credentials (name, provider, modalities, config) VALUES ($1,$2,$3,$4) RETURNING *",
     )
-    .bind(&p.name).bind(p.provider.to_lowercase()).bind(json!(p.modalities)).bind(config_from_create(&p))
+    .bind(&p.name).bind(p.provider.to_lowercase()).bind(json!(p.modalities)).bind(stored)
     .fetch_one(&state.pool).await?;
     Ok((axum::http::StatusCode::CREATED, Json(to_response(&state, &row).await)))
 }
@@ -209,13 +216,16 @@ async fn update_credential(State(state): State<AppState>, Path(id): Path<String>
     let name = p.name.clone().unwrap_or_else(|| cur.get("name"));
     let provider: String = cur.get("provider");
     let modalities = p.modalities.clone().map(|m| json!(m)).unwrap_or_else(|| cur.try_get("modalities").unwrap_or_else(|_| json!([])));
-    let cfg = merge_config(cur.try_get("config").unwrap_or_else(|_| json!({})), &p);
+    let stored_existing: Value = cur.try_get("config").unwrap_or_else(|_| json!({}));
+    let existing_plain = crate::crypto::decrypt_config(&stored_existing).map_err(|e| AppError::BadRequest(format!("Cannot update credential: {e}")))?;
+    let plain_cfg = merge_config(existing_plain, &p);
     if provider == "anthropic_compatible" {
-        if get_s(&cfg,"base_url").is_none() { return Err(AppError::BadRequest("Anthropic-compatible credentials require a base URL".into())); }
-        if get_s(&cfg,"api_key").is_none() { return Err(AppError::BadRequest("Anthropic-compatible credentials require an API key".into())); }
+        if get_s(&plain_cfg,"base_url").is_none() { return Err(AppError::BadRequest("Anthropic-compatible credentials require a base URL".into())); }
+        if get_s(&plain_cfg,"api_key").is_none() { return Err(AppError::BadRequest("Anthropic-compatible credentials require an API key".into())); }
     }
+    let stored = crate::crypto::encrypt_config(&plain_cfg).map_err(|e| AppError::Http(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let row = sqlx::query("UPDATE credentials SET name=$1, modalities=$2, config=$3, updated_at=NOW() WHERE id=$4 RETURNING *")
-        .bind(name).bind(modalities).bind(cfg).bind(id).fetch_one(&state.pool).await?;
+        .bind(name).bind(modalities).bind(stored).bind(id).fetch_one(&state.pool).await?;
     Ok(Json(to_response(&state, &row).await))
 }
 

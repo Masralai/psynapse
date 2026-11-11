@@ -80,7 +80,7 @@ async fn cancel_command_job(
 ) -> Result<Json<Value>, AppError> {
     let id = Uuid::parse_str(&job_id).map_err(|_| AppError::NotFound)?;
     let res = sqlx::query(
-        "UPDATE jobs SET status='canceled', completed_at=NOW() WHERE id=$1 AND status IN ('pending','queued','running')",
+        "UPDATE jobs SET status='canceled', error_message=COALESCE(error_message,'Canceled by user'), completed_at=NOW() WHERE id=$1 AND status IN ('pending','queued','running')",
     )
     .bind(id)
     .execute(&state.pool)
@@ -93,20 +93,29 @@ async fn cancel_command_job(
 }
 
 async fn debug_registry() -> Json<Value> {
+    // ponytail: static registry metadata; handler introspection/observability parity pending.
     let cmds = vec![
-        "process_source",
-        "run_transformation",
-        "embed_source",
-        "embed_note",
-        "rebuild_embeddings",
+        ("process_source", "Extract/index source content and run requested post-processing"),
+        ("run_transformation", "Generate and persist a source insight from a transformation"),
+        ("embed_source", "Chunk and embed a source's text into pgvector storage"),
+        ("embed_note", "Embed a note's content for vector search"),
+        ("rebuild_embeddings", "Rebuild embeddings for selected content types"),
+        ("generate_podcast", "Generate podcast outline/transcript artifacts for an episode (audio pending)"),
     ];
     let items: Vec<Value> = cmds
         .iter()
-        .map(|n| serde_json::json!({"app_id":"psynapse","name":n,"full_id":format!("psynapse.{n}")}))
+        .map(|(n, desc)| serde_json::json!({
+            "app_id":"psynapse",
+            "name":n,
+            "full_id":format!("psynapse.{n}"),
+            "description": desc,
+            "has_handler": true
+        }))
         .collect();
+    let names: Vec<&str> = cmds.iter().map(|(n, _)| *n).collect();
     Json(serde_json::json!({
         "total_commands": cmds.len(),
-        "commands_by_app": { "psynapse": cmds },
+        "commands_by_app": { "psynapse": names },
         "command_items": items
     }))
 }

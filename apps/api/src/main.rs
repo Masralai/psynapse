@@ -17,7 +17,11 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::create_pool(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    tokio::spawn(psynapse_api::jobs::run_worker(pool.clone()));
+    tokio::spawn(psynapse_api::jobs::run_worker(
+        pool.clone(),
+        config.job_poll_interval_secs,
+        config.job_retry_backoff_secs,
+    ));
 
     let state = AppState { pool };
     let app = routes::api_routes(state).layer(CorsLayer::permissive());

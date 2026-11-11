@@ -504,6 +504,25 @@ async fn create_source_inner(
 
     let mut detail = get_source_detail(&state.pool, source_id).await?;
     if let Some(cid) = command_id { detail.base.command_id = Some(cid.to_string()); detail.base.status = Some("queued".into()); }
+
+    // ponytail: best-effort background embedding/transformations for sync text sources with stored content.
+    if !payload.async_processing {
+        if let Some(ref ft) = full_text {
+            if !ft.trim().is_empty() {
+                if payload.embed {
+                    let _ = jobs::enqueue(&state.pool, "psynapse", "embed_source", json!({"source_id": source_id.to_string()})).await;
+                }
+                if let Some(tids) = &payload.transformations {
+                    for tid in tids {
+                        if Uuid::parse_str(tid).is_ok() {
+                            let _ = jobs::enqueue(&state.pool, "psynapse", "run_transformation", json!({"source_id": source_id.to_string(), "transformation_id": tid})).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _ = saved_path; // retained on disk
     Ok(Json(detail))
 }
