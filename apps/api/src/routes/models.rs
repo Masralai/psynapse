@@ -247,6 +247,10 @@ async fn auto_assign(State(_state): State<AppState>) -> Json<Value> {
         "default_text_to_speech_model","default_speech_to_text_model","default_tools_model"
     ]}))
 }
-async fn test_model(State(_state): State<AppState>, Path(_id): Path<String>) -> Json<Value> {
-    Json(json!({"success": false, "message": "Model testing requires provider pipeline (not yet configured)"}))
+async fn test_model(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    // ponytail: minimal OpenAI-compatible chat test prompt; not all provider modalities covered.
+    match crate::providers::chat_completion(&state.pool, Some(&id), None, "You are a test helper.", "Reply with exactly: OK").await {
+        Ok(out) => Json(json!({"success": true, "message": "Model call succeeded", "details": out.chars().take(200).collect::<String>()})),
+        Err(e) => Json(json!({"success": false, "message": e.to_string()})),
+    }
 }

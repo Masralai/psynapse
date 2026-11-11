@@ -67,7 +67,7 @@ async fn embed_content(
         if exists.is_none() { return Err(AppError::Http(axum::http::StatusCode::NOT_FOUND, "note not found".into())); }
     }
 
-    // ponytail: embedding provider not wired; enqueue job for worker to complete as placeholder.
+    // ponytail: queued for worker; worker performs chunking+embedding when model configured.
     let cmd_name = if item_type == "source" { "embed_source" } else { "embed_note" };
     let input = json!({ if item_type == "source" { "source_id" } else { "note_id" }: req.item_id });
     let cid = jobs::enqueue(&state.pool, "psynapse", cmd_name, input).await?;

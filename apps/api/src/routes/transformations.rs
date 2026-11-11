@@ -171,12 +171,27 @@ async fn execute_transformation(
     Json(p): Json<ExecuteTransformationRequest>,
 ) -> Result<Json<ExecuteTransformationResponse>, AppError> {
     let id = Uuid::parse_str(&p.transformation_id).map_err(|_| AppError::NotFound)?;
-    let row = sqlx::query("SELECT prompt, model_id FROM transformations WHERE id=$1")
+    let row = sqlx::query("SELECT prompt, model_id, title FROM transformations WHERE id=$1")
         .bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
     let prompt: String = row.get("prompt");
+    let title: String = row.try_get("title").unwrap_or_else(|_| "Transformation".into());
     let model_id = p.model_id.or_else(|| row.try_get::<Option<Uuid>, _>("model_id").ok().flatten().map(|u| u.to_string()));
-    // ponytail: no LLM/provider execution wired yet; deterministic placeholder keeps endpoint usable.
-    let output = format!("[transformation pending provider pipeline]\n\nPrompt:\n{}\n\nInput:\n{}", prompt, p.input_text);
+
+    // ponytail: single-turn chat-completions execution; no graph/provider-specific features.
+    let system = "You apply the given transformation prompt to the user's input. Return only the transformed result.";
+    let user = format!("Transformation: {title}\n\nInstructions:\n{prompt}\n\nInput:\n{}", p.input_text);
+    let output = match crate::providers::chat_completion(&state.pool, model_id.as_deref(), Some("default_transformation_model"), system, &user).await {
+        Ok(text) => text,
+        Err(e) => {
+            // keep endpoint usable if no provider configured yet
+            let msg = e.to_string();
+            if msg.contains("No model configured") || msg.contains("No base URL") {
+                format!("[transformation pending provider pipeline]\n\nPrompt:\n{prompt}\n\nInput:\n{}", p.input_text)
+            } else {
+                return Err(e);
+            }
+        }
+    };
     Ok(Json(ExecuteTransformationResponse {
         output,
         transformation_id: id.to_string(),

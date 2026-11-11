@@ -117,6 +117,10 @@ async fn create_note(
             .bind(note_id).bind(nb).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    // ponytail: best-effort auto-embed enqueue when content exists (job skips if embedding model unconfigured).
+    if payload.content.trim().len() > 0 {
+        let _ = crate::jobs::enqueue(&state.pool, "psynapse", "embed_note", json!({"note_id": note_id.to_string()})).await;
+    }
     Ok(Json(to_resp(&row)))
 }
 
@@ -144,11 +148,16 @@ async fn update_note(
     if note_type != "human" && note_type != "ai" {
         return Err(AppError::BadRequest("note_type must be 'human' or 'ai'".into()));
     }
+    let new_content = content.clone();
     let row = sqlx::query(
         "UPDATE notes SET title=$1, content=$2, note_type=$3, updated_at=NOW() WHERE id=$4 RETURNING id, title, content, note_type, created_at, updated_at",
     )
     .bind(title).bind(content).bind(note_type).bind(id)
     .fetch_one(&state.pool).await?;
+    // ponytail: best-effort auto-embed enqueue when note has content.
+    if new_content.as_deref().map(str::trim).unwrap_or("").len() > 0 {
+        let _ = crate::jobs::enqueue(&state.pool, "psynapse", "embed_note", json!({"note_id": id.to_string()})).await;
+    }
     Ok(Json(to_resp(&row)))
 }
 

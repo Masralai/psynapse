@@ -234,13 +234,45 @@ async fn send_message(
     let sess = Uuid::parse_str(&session_id).map_err(|_| AppError::NotFound)?;
     ensure_related(&state.pool, sid, sess).await?;
 
-    // ponytail: persist + stream placeholder reply; model/provider execution pending.
+    let sess_row = sqlx::query("SELECT model_override FROM chat_sessions WHERE id=$1")
+        .bind(sess).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    let session_model: Option<String> = sess_row.try_get("model_override").ok().flatten();
+    let model_id = p.model_override.clone().or(session_model);
+
     sqlx::query("INSERT INTO chat_messages (session_id, role, content) VALUES ($1,'human',$2)")
         .bind(sess).bind(&p.message).execute(&state.pool).await?;
-    let answer = format!(
-        "I can’t run source chat with a model yet (provider pipeline pending). You asked: {}",
-        p.message.chars().take(400).collect::<String>()
-    );
+
+    let src = sqlx::query("SELECT title, full_text FROM sources WHERE id=$1")
+        .bind(sid).fetch_optional(&state.pool).await?;
+    let (stitle, stext) = if let Some(r) = src {
+        (r.try_get::<Option<String>,_>("title").ok().flatten().unwrap_or_else(|| "Untitled source".into()),
+         r.try_get::<Option<String>,_>("full_text").ok().flatten().unwrap_or_default())
+    } else { ("Untitled source".into(), String::new()) };
+    let insights = sqlx::query("SELECT id::text as id, content FROM source_insights WHERE source_id=$1 ORDER BY created_at DESC LIMIT 10")
+        .bind(sid).fetch_all(&state.pool).await.unwrap_or_default();
+    let mut ctx = format!("[Source] {stitle}\n{}\n", stext.chars().take(8000).collect::<String>());
+    let mut insight_ids = Vec::new();
+    for i in &insights {
+        let iid: String = i.get("id");
+        insight_ids.push(iid);
+        if let Ok(c) = i.try_get::<String,_>("content") { ctx.push_str(&format!("\n[Insight]\n{}\n", c.chars().take(1200).collect::<String>())); }
+    }
+    let system = "You are a helpful assistant answering questions about the provided source. Use the source content and insights when relevant.";
+    let user = format!("Source context:\n{ctx}\n\nUser message:\n{}", p.message);
+
+    let answer = match crate::providers::chat_completion(&state.pool, model_id.as_deref(), Some("default_chat_model"), system, &user).await {
+        Ok(text) => text,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No model configured") || msg.contains("No base URL") {
+                format!("I can’t run source chat with a model yet (provider/model not configured). You asked: {}", p.message.chars().take(400).collect::<String>())
+            } else {
+                let err = json!({"type":"error","message": e.to_string()}).to_string();
+                return Ok(Sse::new(stream::iter(vec![Ok(Event::default().data(err))])));
+            }
+        }
+    };
+
     sqlx::query("INSERT INTO chat_messages (session_id, role, content) VALUES ($1,'ai',$2)")
         .bind(sess).bind(&answer).execute(&state.pool).await?;
     sqlx::query("UPDATE chat_sessions SET updated_at=NOW(), model_override=COALESCE($2, model_override) WHERE id=$1")
@@ -249,7 +281,7 @@ async fn send_message(
     let events = vec![
         Ok(Event::default().data(json!({"type":"user_message","content": p.message}).to_string())),
         Ok(Event::default().data(json!({"type":"ai_message","content": answer}).to_string())),
-        Ok(Event::default().data(json!({"type":"context_indicators","data":{"sources":[sid.to_string()],"insights":[],"notes":[]}}).to_string())),
+        Ok(Event::default().data(json!({"type":"context_indicators","data":{"sources":[sid.to_string()],"insights": insight_ids,"notes":[]}}).to_string())),
         Ok(Event::default().data(json!({"type":"complete"}).to_string())),
     ];
     Ok(Sse::new(stream::iter(events)))

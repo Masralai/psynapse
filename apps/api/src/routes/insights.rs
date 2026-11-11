@@ -115,6 +115,10 @@ async fn save_as_note(
             .bind(note_id).bind(nb).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    // ponytail: best-effort auto-embed enqueue for saved insight note.
+    if content.trim().len() > 0 {
+        let _ = crate::jobs::enqueue(&state.pool, "psynapse", "embed_note", json!({"note_id": note_id.to_string()})).await;
+    }
 
     Ok(Json(NoteResponse {
         id: note_id.to_string(),

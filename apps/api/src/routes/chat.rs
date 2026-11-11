@@ -255,16 +255,30 @@ async fn execute_chat(
     Json(p): Json<ExecuteChatRequest>,
 ) -> Result<Json<ExecuteChatResponse>, AppError> {
     let sid = Uuid::parse_str(&p.session_id).map_err(|_| AppError::NotFound)?;
-    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM chat_sessions WHERE id=$1").bind(sid).fetch_optional(&state.pool).await?;
-    if exists.is_none() { return Err(AppError::NotFound); }
+    let sess = sqlx::query("SELECT model_override FROM chat_sessions WHERE id=$1")
+        .bind(sid).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
 
-    // ponytail: persist messages + deterministic placeholder reply; provider/graph execution pending.
     sqlx::query("INSERT INTO chat_messages (session_id, role, content) VALUES ($1,'human',$2)")
         .bind(sid).bind(&p.message).execute(&state.pool).await?;
-    let answer = format!(
-        "I can’t run model-backed chat yet (provider pipeline pending). I received: {}",
-        p.message.chars().take(400).collect::<String>()
-    );
+
+    let session_model: Option<String> = sess.try_get("model_override").ok().flatten();
+    let model_id = p.model_override.clone().or(session_model);
+    let context_text = format_chat_context(&p.context);
+    let system = "You are a helpful notebook assistant. Use the provided notebook context when relevant. If the context is insufficient, say so briefly.";
+    let user = format!("Context:\n{context_text}\n\nUser message:\n{}", p.message);
+
+    let answer = match crate::providers::chat_completion(&state.pool, model_id.as_deref(), Some("default_chat_model"), system, &user).await {
+        Ok(text) => text,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No model configured") || msg.contains("No base URL") {
+                format!("I can’t run model-backed chat yet (provider/model not configured). I received: {}", p.message.chars().take(400).collect::<String>())
+            } else {
+                return Err(e);
+            }
+        }
+    };
+
     sqlx::query("INSERT INTO chat_messages (session_id, role, content) VALUES ($1,'ai',$2)")
         .bind(sid).bind(&answer).execute(&state.pool).await?;
     sqlx::query("UPDATE chat_sessions SET updated_at=NOW(), model_override=COALESCE($2, model_override) WHERE id=$1")
@@ -272,6 +286,39 @@ async fn execute_chat(
 
     let messages = get_messages(&state.pool, sid).await?;
     Ok(Json(ExecuteChatResponse { session_id: p.session_id, messages }))
+}
+
+fn format_chat_context(ctx: &Value) -> String {
+    // ponytail: simple text serialization of selected source/note context.
+    let mut out = String::new();
+    if let Some(sources) = ctx.get("sources").and_then(|v| v.as_array()) {
+        for s in sources.iter().take(20) {
+            let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled source");
+            out.push_str(&format!("\n[Source] {title}\n"));
+            if let Some(txt) = s.get("full_text").and_then(|v| v.as_str()) {
+                out.push_str(&txt.chars().take(4000).collect::<String>());
+                out.push('\n');
+            } else if let Some(ins) = s.get("insights").and_then(|v| v.as_array()) {
+                for i in ins.iter().take(10) {
+                    if let Some(c) = i.get("content").and_then(|v| v.as_str()) {
+                        out.push_str(&c.chars().take(800).collect::<String>());
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    if let Some(notes) = ctx.get("notes").and_then(|v| v.as_array()) {
+        for n in notes.iter().take(20) {
+            let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled note");
+            out.push_str(&format!("\n[Note] {title}\n"));
+            if let Some(txt) = n.get("content").and_then(|v| v.as_str()) {
+                out.push_str(&txt.chars().take(2000).collect::<String>());
+                out.push('\n');
+            }
+        }
+    }
+    if out.trim().is_empty() { "(no context selected)".into() } else { out }
 }
 
 async fn build_context(
