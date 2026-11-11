@@ -20,3 +20,7 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+aes-gcm = "0.10"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
