@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod capabilities;
 pub mod chat;
 pub mod commands;
@@ -27,7 +28,8 @@ pub fn api_routes(state: AppState) -> Router {
         .merge(health::routes())
         .nest(
             "/api",
-            notebooks::routes()
+            auth::routes()
+                .merge(notebooks::routes())
                 .merge(sources::routes())
                 .merge(commands::routes())
                 .merge(notes::routes())

@@ -1,4 +1,5 @@
-use psynapse_api::{config::Config, db, routes, state::AppState};
+use axum::{extract::DefaultBodyLimit, middleware};
+use psynapse_api::{auth, config::Config, db, routes, state::AppState};
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -23,8 +24,18 @@ async fn main() -> anyhow::Result<()> {
         config.job_retry_backoff_secs,
     ));
 
-    let state = AppState { pool };
-    let app = routes::api_routes(state).layer(CorsLayer::permissive());
+    let state = AppState {
+        pool,
+        app_password: config.app_password.clone(),
+    };
+    // ponytail: permissive CORS + coarse body limit/auth gate; runtime hardening/CORS policy parity pending.
+    let app = routes::api_routes(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_password,
+        ))
+        .layer(DefaultBodyLimit::max(config.max_upload_size_bytes))
+        .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
     tracing::info!("listening on {}", addr);
