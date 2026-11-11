@@ -93,9 +93,20 @@ async fn cancel_command_job(
 }
 
 async fn debug_registry() -> Json<Value> {
+    let cmds = vec![
+        "process_source",
+        "run_transformation",
+        "embed_source",
+        "embed_note",
+        "rebuild_embeddings",
+    ];
+    let items: Vec<Value> = cmds
+        .iter()
+        .map(|n| serde_json::json!({"app_id":"psynapse","name":n,"full_id":format!("psynapse.{n}")}))
+        .collect();
     Json(serde_json::json!({
-        "total_commands": 1,
-        "commands_by_app": { "open_notebook": ["process_source"] },
-        "command_items": [{"app_id":"open_notebook","name":"process_source","full_id":"open_notebook.process_source"}]
+        "total_commands": cmds.len(),
+        "commands_by_app": { "psynapse": cmds },
+        "command_items": items
     }))
 }

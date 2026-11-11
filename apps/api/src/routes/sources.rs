@@ -29,7 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sources/:source_id/download", get(download_source_file).head(download_source_file))
         .route("/sources/:source_id/status", get(get_source_status))
         .route("/sources/:source_id/retry", post(retry_source))
-        .route("/sources/:source_id/insights", get(list_source_insights))
+        .route("/sources/:source_id/insights", get(list_source_insights).post(create_source_insight))
 }
 
 #[derive(Serialize)]
@@ -81,6 +81,20 @@ pub struct SourceInsightResponse {
     pub content: String,
     pub created: Option<String>,
     pub updated: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateSourceInsightRequest {
+    pub transformation_id: String,
+}
+
+#[derive(Serialize)]
+pub struct InsightCreationResponse {
+    pub status: String,
+    pub message: String,
+    pub source_id: String,
+    pub transformation_id: String,
+    pub command_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -475,7 +489,7 @@ async fn create_source_inner(
             "transformations": payload.transformations.clone().unwrap_or_default(),
             "embed": payload.embed,
         });
-        let jid = sqlx::query("INSERT INTO jobs (app_name, command_name, input, status) VALUES ('open_notebook','process_source',$1,'queued') RETURNING id")
+        let jid = sqlx::query("INSERT INTO jobs (app_name, command_name, input, status) VALUES ('psynapse','process_source',$1,'queued') RETURNING id")
             .bind(input).fetch_one(&mut *tx).await?;
         let cid: Uuid = jid.get("id");
         sqlx::query("UPDATE sources SET command_id=$1 WHERE id=$2").bind(cid).bind(source_id).execute(&mut *tx).await?;
@@ -534,7 +548,7 @@ async fn retry_source(
     let notebooks: Vec<String> = sqlx::query("SELECT notebook_id FROM source_notebooks WHERE source_id=$1").bind(id).fetch_all(&state.pool).await?
         .into_iter().map(|r| r.get::<Uuid,_>("notebook_id").to_string()).collect();
     let input = json!({"source_id": id.to_string(), "content_state": {"asset": existing.try_get::<Option<Value>,_>("asset").ok().flatten(), "content": existing.try_get::<Option<String>,_>("full_text").ok().flatten()}, "notebook_ids": notebooks, "transformations": [], "embed": true});
-    let row = sqlx::query("INSERT INTO jobs (app_name, command_name, input, status) VALUES ('open_notebook','process_source',$1,'queued') RETURNING id")
+    let row = sqlx::query("INSERT INTO jobs (app_name, command_name, input, status) VALUES ('psynapse','process_source',$1,'queued') RETURNING id")
         .bind(input).fetch_one(&state.pool).await?;
     let cid: Uuid = row.get("id");
     sqlx::query("UPDATE sources SET command_id=$1, status='queued', processing_info=$2, updated_at=NOW() WHERE id=$3")
@@ -550,6 +564,8 @@ async fn list_source_insights(
     Path(source_id): Path<String>,
 ) -> Result<Json<Vec<SourceInsightResponse>>, AppError> {
     let id = Uuid::parse_str(&source_id).map_err(|_| AppError::NotFound)?;
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM sources WHERE id=$1").bind(id).fetch_optional(&state.pool).await?;
+    if exists.is_none() { return Err(AppError::NotFound); }
     let rows = sqlx::query("SELECT id, source_id, insight_type, content, created_at, updated_at FROM source_insights WHERE source_id=$1 ORDER BY created_at DESC")
         .bind(id).fetch_all(&state.pool).await?;
     Ok(Json(rows.into_iter().map(|r| SourceInsightResponse {
@@ -560,4 +576,44 @@ async fn list_source_insights(
         created: fmt_opt(r.try_get("created_at").ok()),
         updated: fmt_opt(r.try_get("updated_at").ok()),
     }).collect()))
+}
+
+async fn create_source_insight(
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+    Json(req): Json<CreateSourceInsightRequest>,
+) -> Result<(axum::http::StatusCode, Json<InsightCreationResponse>), AppError> {
+    let sid = Uuid::parse_str(&source_id).map_err(|_| AppError::NotFound)?;
+    let src = sqlx::query("SELECT full_text FROM sources WHERE id=$1")
+        .bind(sid)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let full_text: Option<String> = src.try_get("full_text").ok().flatten();
+    if full_text.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err(AppError::BadRequest("Source has no text content".into()));
+    }
+    let tid = Uuid::parse_str(&req.transformation_id).map_err(|_| {
+        AppError::Http(axum::http::StatusCode::NOT_FOUND, "Transformation not found".into())
+    })?;
+    let t_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM transformations WHERE id=$1")
+        .bind(tid)
+        .fetch_optional(&state.pool)
+        .await?;
+    if t_exists.is_none() {
+        return Err(AppError::Http(axum::http::StatusCode::NOT_FOUND, "Transformation not found".into()));
+    }
+
+    let input = json!({"source_id": sid.to_string(), "transformation_id": tid.to_string()});
+    let cid = jobs::enqueue(&state.pool, "psynapse", "run_transformation", input).await?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(InsightCreationResponse {
+            status: "pending".into(),
+            message: "Insight generation started".into(),
+            source_id: sid.to_string(),
+            transformation_id: tid.to_string(),
+            command_id: Some(cid.to_string()),
+        }),
+    ))
 }
