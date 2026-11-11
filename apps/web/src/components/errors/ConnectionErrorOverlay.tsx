@@ -106,9 +106,7 @@ export function ConnectionErrorOverlay({
         <div className="text-sm">
           <p>{t('connectionErrors.seeDocumentation')}</p>
           <a
-            href="https://github.com/lfnovo/open-notebook"
-            target="_blank"
-            rel="noopener noreferrer"
+            href="#"
             className="text-primary hover:underline inline-flex items-center gap-1"
           >
             {t('connectionErrors.docLink')}

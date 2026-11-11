@@ -20,7 +20,7 @@ interface DefaultConfig {
   description: string
   modelType: ModelType
   required?: boolean
-  /** When unset, this default falls back to the chat default (see open_notebook/ai/models.py). */
+  /** When unset, this default falls back to the chat default. */
   fallsBackToChat?: boolean
   id: string
 }
