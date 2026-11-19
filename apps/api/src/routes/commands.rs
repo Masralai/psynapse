@@ -30,7 +30,7 @@ async fn get_command_job_status(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let id = Uuid::parse_str(&job_id).map_err(|_| AppError::NotFound)?;
+    let id = jobs::parse_job_id(&job_id)?;
     Ok(Json(jobs::status_payload(&state.pool, id).await?))
 }
 
@@ -41,7 +41,7 @@ async fn list_command_jobs(
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let rows = sqlx::query(
         r#"
-        SELECT id, app_name, command_name, status, result, error_message, created_at, started_at, completed_at, input
+        SELECT id, app_name, command_name, status, result, error_message, retry_count, max_retries, created_at, started_at, completed_at, input
         FROM jobs
         WHERE ($1::text IS NULL OR command_name = $1)
           AND ($2::text IS NULL OR status = $2)
@@ -57,13 +57,23 @@ async fn list_command_jobs(
     let out = rows
         .into_iter()
         .map(|r| {
+            let id = r.get::<Uuid,_>("id").to_string();
+            let app_name = r.get::<String,_>("app_name");
+            let command_name = r.get::<String,_>("command_name");
             serde_json::json!({
-                "id": r.get::<Uuid,_>("id").to_string(),
-                "app_name": r.get::<String,_>("app_name"),
-                "name": r.get::<String,_>("command_name"),
+                "id": id,
+                "job_id": id,
+                "command_id": id,
+                "app_name": app_name,
+                "app": app_name,
+                "command_name": command_name,
+                "name": command_name,
+                "command": command_name,
                 "status": r.get::<String,_>("status"),
                 "result": r.get::<Option<Value>,_>("result"),
                 "error_message": r.get::<Option<String>,_>("error_message"),
+                "retry_count": r.get::<i32,_>("retry_count"),
+                "max_retries": r.get::<i32,_>("max_retries"),
                 "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
                 "started_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("started_at").map(|t| t.to_rfc3339()),
                 "completed_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("completed_at").map(|t| t.to_rfc3339()),
@@ -78,7 +88,7 @@ async fn cancel_command_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let id = Uuid::parse_str(&job_id).map_err(|_| AppError::NotFound)?;
+    let id = jobs::parse_job_id(&job_id)?;
     let res = sqlx::query(
         "UPDATE jobs SET status='canceled', error_message=COALESCE(error_message,'Canceled by user'), completed_at=NOW() WHERE id=$1 AND status IN ('pending','queued','running')",
     )
@@ -89,7 +99,8 @@ async fn cancel_command_job(
         // ponytail: return current state shape-compatible enough for UI pollers instead of hard failing.
         let _ = jobs::status_payload(&state.pool, id).await?;
     }
-    Ok(Json(serde_json::json!({"job_id": id.to_string(), "cancelled": res.rows_affected() > 0})))
+    let cancelled = res.rows_affected() > 0;
+    Ok(Json(serde_json::json!({"job_id": id.to_string(), "command_id": id.to_string(), "cancelled": cancelled, "canceled": cancelled})))
 }
 
 async fn debug_registry() -> Json<Value> {

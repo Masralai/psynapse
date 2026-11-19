@@ -25,6 +25,11 @@ pub async fn enqueue(
     Ok(row.get("id"))
 }
 
+pub fn parse_job_id(s: &str) -> Result<Uuid, AppError> {
+    let s = s.strip_prefix("command:").unwrap_or(s);
+    Uuid::parse_str(s).map_err(|_| AppError::NotFound)
+}
+
 pub async fn status_payload(pool: &PgPool, job_id: Uuid) -> Result<Value, AppError> {
     let row = sqlx::query(
         r#"
@@ -46,11 +51,19 @@ pub async fn status_payload(pool: &PgPool, job_id: Uuid) -> Result<Value, AppErr
         "error": error_message,
         "result": result,
     });
+    let id = row.get::<Uuid, _>("id").to_string();
+    let app_name: String = row.get("app_name");
+    let command_name: String = row.get("command_name");
 
     Ok(json!({
-        "job_id": row.get::<Uuid, _>("id").to_string(),
-        "app_name": row.get::<String, _>("app_name"),
-        "command_name": row.get::<String, _>("command_name"),
+        "id": id,
+        "job_id": id,
+        "command_id": id,
+        "app_name": app_name,
+        "app": app_name,
+        "command_name": command_name,
+        "command": command_name,
+        "name": command_name,
         "status": status,
         "result": result,
         "error_message": error_message,

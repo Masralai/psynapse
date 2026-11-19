@@ -1,4 +1,9 @@
-use axum::{extract::State, response::sse::{Event, Sse}, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    response::sse::{Event, Sse},
+    routing::post,
+    Json, Router,
+};
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +31,8 @@ pub struct SearchRequest {
     pub search_sources: bool,
     #[serde(default = "t")]
     pub search_notes: bool,
+    // ponytail: optional; defaults to search_sources so existing clients unchanged.
+    pub search_insights: Option<bool>,
     #[serde(default)]
     pub minimum_score: f64,
     pub notebook_ids: Option<Vec<String>>,
@@ -54,26 +61,30 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
     let q = req.query.trim().to_string();
     if q.is_empty() { return Ok(Json(SearchResponse { results: vec![], total_count: 0, search_type: req.search_type })); }
     let limit = req.limit.clamp(1, 1000);
+    let search_insights = req.search_insights.unwrap_or(req.search_sources);
     let notebook_ids: Vec<Uuid> = req.notebook_ids.unwrap_or_default().into_iter().filter_map(|s| Uuid::parse_str(&s).ok()).collect();
     let mut results: Vec<Value> = Vec::new();
 
     if req.search_type == "vector" {
-        // ponytail: pgvector similarity using default embedding model; best chunk per source + direct note embeddings.
+        // ponytail: pgvector similarity using default embedding model; best chunk per source + direct note/insight embeddings.
+        // ponytail: simple left() snippets for vector results (no lexical highlight/ranking parity).
         let qvecs = crate::providers::embed_texts(&state.pool, None, vec![q.clone()]).await?;
         let qlit = crate::providers::to_pgvector(&qvecs[0]);
         if req.search_sources {
             let rows = sqlx::query(
                 r#"
                 SELECT sub.id, sub.title, sub.parent_id, (1 - sub.dist)::float8 as final_score,
-                       sub.created_at, sub.updated_at
+                       sub.snippet, sub.created_at, sub.updated_at
                 FROM (
                   SELECT s.id::text as id, COALESCE(s.title,'Untitled source') as title, s.id::text as parent_id,
-                         MIN(se.embedding <=> $1::vector) as dist, s.created_at, s.updated_at
+                         MIN(se.embedding <=> $1::vector) as dist,
+                         left(coalesce(s.full_text,''), 220) as snippet,
+                         s.created_at, s.updated_at
                   FROM source_embeddings se
                   JOIN sources s ON s.id = se.source_id
                   WHERE se.embedding IS NOT NULL
                     AND (cardinality($2::uuid[]) = 0 OR EXISTS (SELECT 1 FROM source_notebooks sn WHERE sn.source_id=s.id AND sn.notebook_id = ANY($2)))
-                  GROUP BY s.id, s.title, s.created_at, s.updated_at
+                  GROUP BY s.id, s.title, s.created_at, s.updated_at, left(coalesce(s.full_text,''), 220)
                   ORDER BY dist ASC
                   LIMIT $3
                 ) sub
@@ -82,16 +93,21 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
             .bind(&qlit).bind(&notebook_ids).bind(limit)
             .fetch_all(&state.pool).await?;
             for r in rows {
-                results.push(json!({
-                    "id": r.get::<String,_>("id"),
+                let id: String = r.get("id");
+                let pid: String = r.get("parent_id");
+                let snippet: String = r.try_get("snippet").unwrap_or_default();
+                let mut obj = json!({
+                    "id": format!("source:{id}"),
                     "title": r.get::<String,_>("title"),
-                    "parent_id": r.get::<String,_>("parent_id"),
+                    "parent_id": pid,
                     "final_score": r.get::<f64,_>("final_score"),
                     "type": "source",
                     "source_type": "source",
                     "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
                     "updated": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),
-                }));
+                });
+                if !snippet.trim().is_empty() { obj["matches"] = json!([snippet]); }
+                results.push(obj);
             }
         }
         if req.search_notes {
@@ -99,6 +115,7 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
                 r#"
                 SELECT n.id::text as id, COALESCE(n.title,'Untitled note') as title, n.id::text as parent_id,
                        (1 - (n.embedding <=> $1::vector))::float8 as final_score,
+                       left(coalesce(n.content,''), 220) as snippet,
                        n.created_at, n.updated_at
                 FROM notes n
                 WHERE n.embedding IS NOT NULL
@@ -110,19 +127,62 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
             .bind(&qlit).bind(&notebook_ids).bind(limit)
             .fetch_all(&state.pool).await?;
             for r in rows {
-                results.push(json!({
-                    "id": r.get::<String,_>("id"),
+                let id: String = r.get("id");
+                let pid: String = r.get("parent_id");
+                let snippet: String = r.try_get("snippet").unwrap_or_default();
+                let mut obj = json!({
+                    "id": format!("note:{id}"),
                     "title": r.get::<String,_>("title"),
-                    "parent_id": r.get::<String,_>("parent_id"),
+                    "parent_id": pid,
                     "final_score": r.get::<f64,_>("final_score"),
                     "type": "note",
                     "source_type": "note",
                     "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
                     "updated": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),
-                }));
+                });
+                if !snippet.trim().is_empty() { obj["matches"] = json!([snippet]); }
+                results.push(obj);
+            }
+        }
+        if search_insights {
+            let rows = sqlx::query(
+                r#"
+                SELECT si.id::text as id,
+                       COALESCE(NULLIF(si.insight_type,''), 'Insight') as title,
+                       si.source_id::text as parent_id,
+                       (1 - (si.embedding <=> $1::vector))::float8 as final_score,
+                       left(coalesce(si.content,''), 220) as snippet,
+                       si.created_at, si.updated_at
+                FROM source_insights si
+                JOIN sources s ON s.id = si.source_id
+                WHERE si.embedding IS NOT NULL
+                  AND (cardinality($2::uuid[]) = 0 OR EXISTS (SELECT 1 FROM source_notebooks sn WHERE sn.source_id=s.id AND sn.notebook_id = ANY($2)))
+                ORDER BY si.embedding <=> $1::vector ASC
+                LIMIT $3
+                "#,
+            )
+            .bind(&qlit).bind(&notebook_ids).bind(limit)
+            .fetch_all(&state.pool).await?;
+            for r in rows {
+                let id: String = r.get("id");
+                let pid: String = r.get("parent_id");
+                let snippet: String = r.try_get("snippet").unwrap_or_default();
+                let mut obj = json!({
+                    "id": format!("source_insight:{id}"),
+                    "title": r.get::<String,_>("title"),
+                    "parent_id": pid,
+                    "final_score": r.get::<f64,_>("final_score"),
+                    "type": "source_insight",
+                    "source_type": "source_insight",
+                    "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
+                    "updated": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),
+                });
+                if !snippet.trim().is_empty() { obj["matches"] = json!([snippet]); }
+                results.push(obj);
             }
         }
     } else {
+        // ponytail: ts_headline snippets for text search (basic highlighting/fragment config).
         if req.search_sources {
             let rows = sqlx::query(
                 r#"
@@ -130,7 +190,8 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
                        COALESCE(s.title,'Untitled source') as title,
                        s.id::text as parent_id,
                        ts_rank_cd(to_tsvector('english', coalesce(s.full_text,'') || ' ' || coalesce(s.title,'')), plainto_tsquery('english', $1))::float8 as final_score,
-                       'source'::text as item_type,
+                       ts_headline('english', left(coalesce(s.full_text,'') || ' ' || coalesce(s.title,''), 4000), plainto_tsquery('english', $1),
+                         'MaxFragments=1, MaxWords=25, MinWords=4, StartSel=<mark>, StopSel=</mark>') as snippet,
                        s.created_at, s.updated_at
                 FROM sources s
                 WHERE to_tsvector('english', coalesce(s.full_text,'') || ' ' || coalesce(s.title,'')) @@ plainto_tsquery('english', $1)
@@ -142,16 +203,21 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
             .bind(&q).bind(&notebook_ids).bind(limit)
             .fetch_all(&state.pool).await?;
             for r in rows {
-                results.push(json!({
-                    "id": r.get::<String,_>("id"),
+                let id: String = r.get("id");
+                let pid: String = r.get("parent_id");
+                let snippet: String = r.try_get("snippet").unwrap_or_default();
+                let mut obj = json!({
+                    "id": format!("source:{id}"),
                     "title": r.get::<String,_>("title"),
-                    "parent_id": r.get::<String,_>("parent_id"),
+                    "parent_id": pid,
                     "final_score": r.get::<f64,_>("final_score"),
                     "type": "source",
                     "source_type": "source",
                     "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
                     "updated": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),
-                }));
+                });
+                if !snippet.trim().is_empty() { obj["matches"] = json!([snippet]); }
+                results.push(obj);
             }
         }
         if req.search_notes {
@@ -161,7 +227,8 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
                        COALESCE(n.title,'Untitled note') as title,
                        n.id::text as parent_id,
                        ts_rank_cd(to_tsvector('english', coalesce(n.content,'') || ' ' || coalesce(n.title,'')), plainto_tsquery('english', $1))::float8 as final_score,
-                       'note'::text as item_type,
+                       ts_headline('english', left(coalesce(n.content,'') || ' ' || coalesce(n.title,''), 4000), plainto_tsquery('english', $1),
+                         'MaxFragments=1, MaxWords=25, MinWords=4, StartSel=<mark>, StopSel=</mark>') as snippet,
                        n.created_at, n.updated_at
                 FROM notes n
                 WHERE to_tsvector('english', coalesce(n.content,'') || ' ' || coalesce(n.title,'')) @@ plainto_tsquery('english', $1)
@@ -173,16 +240,59 @@ async fn search(State(state): State<AppState>, Json(req): Json<SearchRequest>) -
             .bind(&q).bind(&notebook_ids).bind(limit)
             .fetch_all(&state.pool).await?;
             for r in rows {
-                results.push(json!({
-                    "id": r.get::<String,_>("id"),
+                let id: String = r.get("id");
+                let pid: String = r.get("parent_id");
+                let snippet: String = r.try_get("snippet").unwrap_or_default();
+                let mut obj = json!({
+                    "id": format!("note:{id}"),
                     "title": r.get::<String,_>("title"),
-                    "parent_id": r.get::<String,_>("parent_id"),
+                    "parent_id": pid,
                     "final_score": r.get::<f64,_>("final_score"),
                     "type": "note",
                     "source_type": "note",
                     "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
                     "updated": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),
-                }));
+                });
+                if !snippet.trim().is_empty() { obj["matches"] = json!([snippet]); }
+                results.push(obj);
+            }
+        }
+        if search_insights {
+            let rows = sqlx::query(
+                r#"
+                SELECT si.id::text as id,
+                       COALESCE(NULLIF(si.insight_type,''), 'Insight') as title,
+                       si.source_id::text as parent_id,
+                       ts_rank_cd(to_tsvector('english', coalesce(si.content,'') || ' ' || coalesce(si.insight_type,'')), plainto_tsquery('english', $1))::float8 as final_score,
+                       ts_headline('english', left(coalesce(si.content,'') || ' ' || coalesce(si.insight_type,''), 4000), plainto_tsquery('english', $1),
+                         'MaxFragments=1, MaxWords=25, MinWords=4, StartSel=<mark>, StopSel=</mark>') as snippet,
+                       si.created_at, si.updated_at
+                FROM source_insights si
+                JOIN sources s ON s.id = si.source_id
+                WHERE to_tsvector('english', coalesce(si.content,'') || ' ' || coalesce(si.insight_type,'')) @@ plainto_tsquery('english', $1)
+                  AND (cardinality($2::uuid[]) = 0 OR EXISTS (SELECT 1 FROM source_notebooks sn WHERE sn.source_id=s.id AND sn.notebook_id = ANY($2)))
+                ORDER BY final_score DESC
+                LIMIT $3
+                "#,
+            )
+            .bind(&q).bind(&notebook_ids).bind(limit)
+            .fetch_all(&state.pool).await?;
+            for r in rows {
+                let id: String = r.get("id");
+                let pid: String = r.get("parent_id");
+                let snippet: String = r.try_get("snippet").unwrap_or_default();
+                let mut obj = json!({
+                    "id": format!("source_insight:{id}"),
+                    "title": r.get::<String,_>("title"),
+                    "parent_id": pid,
+                    "final_score": r.get::<f64,_>("final_score"),
+                    "type": "source_insight",
+                    "source_type": "source_insight",
+                    "created": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),
+                    "updated": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),
+                });
+                if !snippet.trim().is_empty() { obj["matches"] = json!([snippet]); }
+                results.push(obj);
             }
         }
     }
@@ -201,7 +311,7 @@ async fn ask(State(state): State<AppState>, Json(req): Json<AskRequest>) -> Sse<
     let strategy = json!({
         "type": "strategy",
         "reasoning": "Using direct text search over selected notebooks and answering with the configured model.",
-        "searches": [{"term": q, "instructions": "Retrieve relevant source/note excerpts"}]
+        "searches": [{"term": q, "instructions": "Retrieve relevant source/note/insight excerpts"}]
     });
     let ctx = gather_ask_context(&state.pool, &q, req.notebook_ids.clone()).await.unwrap_or_else(|_| "(context unavailable)".into());
     let system = "You answer questions using the provided knowledge base excerpts. Cite uncertainty if context is insufficient.";
@@ -221,6 +331,7 @@ async fn ask(State(state): State<AppState>, Json(req): Json<AskRequest>) -> Sse<
     };
     let events = vec![
         Ok(Event::default().data(strategy.to_string())),
+        Ok(Event::default().data(json!({"type":"answer","content": answer}).to_string())),
         Ok(Event::default().data(json!({"type":"final_answer","content": answer}).to_string())),
         Ok(Event::default().data(json!({"type":"complete","final_answer": answer}).to_string())),
     ];
@@ -238,7 +349,7 @@ async fn ask_simple(State(state): State<AppState>, Json(req): Json<AskRequest>) 
 }
 
 async fn gather_ask_context(pool: &sqlx::PgPool, q: &str, notebook_ids: Option<Vec<String>>) -> Result<String, AppError> {
-    // ponytail: reuse simple FTS excerpts; no embeddings/ranking parity.
+    // ponytail: simple FTS excerpts from sources/notes/insights; no embeddings/ranking parity.
     let notebook_ids: Vec<Uuid> = notebook_ids.unwrap_or_default().into_iter().filter_map(|s| Uuid::parse_str(&s).ok()).collect();
     let mut out = String::new();
     let srows = sqlx::query(
@@ -272,6 +383,23 @@ async fn gather_ask_context(pool: &sqlx::PgPool, q: &str, notebook_ids: Option<V
         let title: String = r.get("title");
         let excerpt: String = r.try_get("excerpt").unwrap_or_default();
         if !excerpt.trim().is_empty() { out.push_str(&format!("\n[Note] {title}\n{excerpt}\n")); }
+    }
+    let irows = sqlx::query(
+        r#"
+        SELECT COALESCE(NULLIF(si.insight_type,''), 'Insight') as title, left(coalesce(si.content,''), 800) as excerpt
+        FROM source_insights si
+        JOIN sources s ON s.id = si.source_id
+        WHERE ($1 = '' OR to_tsvector('english', coalesce(si.content,'') || ' ' || coalesce(si.insight_type,'')) @@ plainto_tsquery('english', $1))
+          AND (cardinality($2::uuid[]) = 0 OR EXISTS (SELECT 1 FROM source_notebooks sn WHERE sn.source_id=s.id AND sn.notebook_id = ANY($2)))
+        ORDER BY si.updated_at DESC
+        LIMIT 5
+        "#,
+    )
+    .bind(q).bind(&notebook_ids).fetch_all(pool).await?;
+    for r in irows {
+        let title: String = r.get("title");
+        let excerpt: String = r.try_get("excerpt").unwrap_or_default();
+        if !excerpt.trim().is_empty() { out.push_str(&format!("\n[Insight] {title}\n{excerpt}\n")); }
     }
     if out.trim().is_empty() { Ok("(no matching excerpts found)".into()) } else { Ok(out) }
 }

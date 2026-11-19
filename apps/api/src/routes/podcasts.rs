@@ -182,7 +182,7 @@ async fn generate_podcast(
 }
 
 async fn get_podcast_job_status(State(state): State<AppState>, Path(job_id): Path<String>) -> Result<Json<Value>, AppError> {
-    let id = Uuid::parse_str(&job_id).map_err(|_| AppError::NotFound)?;
+    let id = jobs::parse_job_id(&job_id)?;
     Ok(Json(jobs::status_payload(&state.pool, id).await?))
 }
 

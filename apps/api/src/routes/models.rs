@@ -240,12 +240,69 @@ async fn models_by_provider(State(state): State<AppState>, Path(provider): Path<
         .bind(provider).fetch_all(&state.pool).await?;
     Ok(Json(rows.iter().map(row_to_model).collect()))
 }
-async fn auto_assign(State(_state): State<AppState>) -> Json<Value> {
-    // ponytail: needs ranking/availability logic; placeholder to satisfy API surface.
-    Json(json!({"assigned": {}, "skipped": [], "missing": [
-        "default_chat_model","default_embedding_model","default_transformation_model","large_context_model",
-        "default_text_to_speech_model","default_speech_to_text_model","default_tools_model"
-    ]}))
+async fn auto_assign(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    // ponytail: assign first available model per slot by type; no provider preference/ranking.
+    let mut defaults = get_defaults(State(state.clone())).await?.0;
+    let slots: [(&str, &str); 7] = [
+        ("default_chat_model", "language"),
+        ("default_transformation_model", "language"),
+        ("large_context_model", "language"),
+        ("default_text_to_speech_model", "text_to_speech"),
+        ("default_speech_to_text_model", "speech_to_text"),
+        ("default_embedding_model", "embedding"),
+        ("default_tools_model", "language"),
+    ];
+    let mut assigned = serde_json::Map::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    for (slot, mtype) in slots {
+        let cur = match slot {
+            "default_chat_model" => defaults.default_chat_model.clone(),
+            "default_transformation_model" => defaults.default_transformation_model.clone(),
+            "large_context_model" => defaults.large_context_model.clone(),
+            "default_text_to_speech_model" => defaults.default_text_to_speech_model.clone(),
+            "default_speech_to_text_model" => defaults.default_speech_to_text_model.clone(),
+            "default_embedding_model" => defaults.default_embedding_model.clone(),
+            "default_tools_model" => defaults.default_tools_model.clone(),
+            _ => None,
+        };
+        if cur.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            skipped.push(slot.to_string());
+            continue;
+        }
+        let row = sqlx::query(
+            "SELECT id::text as id FROM models WHERE type=$1 ORDER BY created_at ASC, provider ASC, name ASC LIMIT 1",
+        )
+        .bind(mtype)
+        .fetch_optional(&state.pool)
+        .await?;
+        if let Some(r) = row {
+            let id: String = r.get("id");
+            match slot {
+                "default_chat_model" => defaults.default_chat_model = Some(id.clone()),
+                "default_transformation_model" => defaults.default_transformation_model = Some(id.clone()),
+                "large_context_model" => defaults.large_context_model = Some(id.clone()),
+                "default_text_to_speech_model" => defaults.default_text_to_speech_model = Some(id.clone()),
+                "default_speech_to_text_model" => defaults.default_speech_to_text_model = Some(id.clone()),
+                "default_embedding_model" => defaults.default_embedding_model = Some(id.clone()),
+                "default_tools_model" => defaults.default_tools_model = Some(id.clone()),
+                _ => {}
+            }
+            assigned.insert(slot.to_string(), json!(id));
+        } else {
+            missing.push(slot.to_string());
+        }
+    }
+    if !assigned.is_empty() {
+        sqlx::query(
+            "INSERT INTO settings (key,value,updated_at) VALUES ('model_defaults',$1,NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+        )
+        .bind(json!(defaults))
+        .execute(&state.pool)
+        .await?;
+    }
+    Ok(Json(json!({"assigned": assigned, "skipped": skipped, "missing": missing})))
 }
 async fn test_model(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
     // ponytail: minimal OpenAI-compatible chat test prompt; not all provider modalities covered.

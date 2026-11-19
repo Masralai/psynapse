@@ -126,7 +126,7 @@ async fn rebuild_status(
     State(state): State<AppState>,
     Path(command_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let id = Uuid::parse_str(&command_id).map_err(|_| AppError::NotFound)?;
+    let id = crate::jobs::parse_job_id(&command_id)?;
     let row = sqlx::query(
         "SELECT status, result, error_message, created_at, started_at, completed_at, input FROM jobs WHERE id=$1",
     )

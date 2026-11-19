@@ -298,11 +298,11 @@ fn format_chat_context(ctx: &Value) -> String {
             if let Some(txt) = s.get("full_text").and_then(|v| v.as_str()) {
                 out.push_str(&txt.chars().take(4000).collect::<String>());
                 out.push('\n');
-            } else if let Some(ins) = s.get("insights").and_then(|v| v.as_array()) {
+            }
+            if let Some(ins) = s.get("insights").and_then(|v| v.as_array()) {
                 for i in ins.iter().take(10) {
                     if let Some(c) = i.get("content").and_then(|v| v.as_str()) {
-                        out.push_str(&c.chars().take(800).collect::<String>());
-                        out.push('\n');
+                        out.push_str(&format!("[Insight]\n{}\n", c.chars().take(800).collect::<String>()));
                     }
                 }
             }
@@ -334,10 +334,22 @@ async fn build_context(
         if let Ok(uid) = Uuid::parse_str(id) {
             if let Ok(Some(row)) = sqlx::query("SELECT id, title, full_text FROM sources WHERE id=$1").bind(uid).fetch_optional(&state.pool).await {
                 let full = mode == "full content";
+                // ponytail: include insights for insights/full modes so notebook chat can use them.
+                let want_insights = mode == "insights" || full;
+                let insights = if want_insights {
+                    let irows = sqlx::query("SELECT id::text as id, insight_type, content FROM source_insights WHERE source_id=$1 ORDER BY created_at DESC LIMIT 20")
+                        .bind(uid).fetch_all(&state.pool).await.unwrap_or_default();
+                    irows.into_iter().map(|ir| json!({
+                        "id": ir.get::<String,_>("id"),
+                        "insight_type": ir.try_get::<String,_>("insight_type").ok(),
+                        "content": ir.try_get::<String,_>("content").ok(),
+                    })).collect::<Vec<_>>()
+                } else { vec![] };
                 sources_ctx.push(json!({
                     "id": row.get::<Uuid,_>("id").to_string(),
                     "title": row.try_get::<Option<String>,_>("title").ok().flatten(),
                     "full_text": if full { row.try_get::<Option<String>,_>("full_text").ok().flatten() } else { None },
+                    "insights": insights,
                     "mode": mode,
                 }));
             }

@@ -278,11 +278,32 @@ async fn send_message(
     sqlx::query("UPDATE chat_sessions SET updated_at=NOW(), model_override=COALESCE($2, model_override) WHERE id=$1")
         .bind(sess).bind(&p.model_override).execute(&state.pool).await?;
 
-    let events = vec![
-        Ok(Event::default().data(json!({"type":"user_message","content": p.message}).to_string())),
-        Ok(Event::default().data(json!({"type":"ai_message","content": answer}).to_string())),
-        Ok(Event::default().data(json!({"type":"context_indicators","data":{"sources":[sid.to_string()],"insights": insight_ids,"notes":[]}}).to_string())),
-        Ok(Event::default().data(json!({"type":"complete"}).to_string())),
-    ];
+    // ponytail: chunked ai_message events for progressive UI rendering (not provider token streaming).
+    let mut events = Vec::new();
+    events.push(Ok(Event::default().data(json!({"type":"user_message","content": p.message}).to_string())));
+    for chunk in chunk_sse_content(&answer, 120) {
+        events.push(Ok(Event::default().data(json!({"type":"ai_message","content": chunk}).to_string())));
+    }
+    events.push(Ok(Event::default().data(json!({"type":"context_indicators","data":{"sources":[sid.to_string()],"insights": insight_ids,"notes":[]}}).to_string())));
+    events.push(Ok(Event::default().data(json!({"type":"complete"}).to_string())));
     Ok(Sse::new(stream::iter(events)))
 }
+
+fn chunk_sse_content(s: &str, max_chars: usize) -> Vec<String> {
+    if s.is_empty() { return vec![String::new()]; }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0usize;
+    for ch in s.chars() {
+        cur.push(ch);
+        n += 1;
+        if n >= max_chars {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+    }
+    if !cur.is_empty() || out.is_empty() { out.push(cur); }
+    out.into_iter().filter(|c| !c.is_empty() || out_is_single_placeholder(c)).collect::<Vec<_>>()
+}
+
+fn out_is_single_placeholder(_c: &str) -> bool { false }
