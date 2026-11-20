@@ -10,6 +10,7 @@ pub struct Config {
     pub job_retry_backoff_secs: u64,
     pub app_password: Option<String>,
     pub max_upload_size_bytes: usize,
+    pub cors_origins: Vec<String>,
 }
 
 impl Config {
@@ -30,6 +31,13 @@ impl Config {
             .filter(|v: &f64| *v > 0.0)
             .unwrap_or(100.0);
         let max_upload_size_bytes = (max_upload_size_mb * 1024.0 * 1024.0) as usize;
+
+        // ponytail: optional comma/space-separated origins; empty => permissive CORS fallback.
+        let cors_origins_raw = env::var("CORS_ORIGINS")
+            .ok()
+            .or_else(|| env::var("CORS_ALLOW_ORIGINS").ok())
+            .unwrap_or_default();
+        let cors_origins = parse_cors_origins(&cors_origins_raw);
 
         Ok(Config {
             database_url: env::var("DATABASE_URL")
@@ -52,6 +60,30 @@ impl Config {
                 .unwrap_or(5),
             app_password,
             max_upload_size_bytes,
+            cors_origins,
         })
+    }
+}
+
+pub(crate) fn parse_cors_origins(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cors_origins_splits_trims_trailing_slash_and_filters() {
+        assert!(parse_cors_origins("").is_empty());
+        assert_eq!(parse_cors_origins("http://a.com"), vec!["http://a.com"]);
+        assert_eq!(
+            parse_cors_origins("http://a.com, https://b.com/  http://c.com"),
+            vec!["http://a.com", "https://b.com", "http://c.com"]
+        );
+        assert!(parse_cors_origins(" ,  , ").is_empty());
     }
 }
