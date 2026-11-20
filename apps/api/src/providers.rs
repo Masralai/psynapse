@@ -133,6 +133,7 @@ pub fn chunk_text(text: &str, chunk_chars: usize, overlap: usize) -> Vec<String>
     if text.is_empty() {
         return vec![];
     }
+    let chunk_chars = chunk_chars.max(1);
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= chunk_chars {
         return vec![text.to_string()];
@@ -148,9 +149,10 @@ pub fn chunk_text(text: &str, chunk_chars: usize, overlap: usize) -> Vec<String>
         if end == chars.len() {
             break;
         }
-        i = end.saturating_sub(overlap.min(chunk_chars.saturating_sub(1)));
-        if i == 0 && end == chars.len() { break; }
-        if i >= end { i = end; }
+        let step_back = overlap.min(chunk_chars.saturating_sub(1));
+        let next = end.saturating_sub(step_back);
+        i = if next > i { next } else { end }; // ponytail: guarantee progress even with large overlap
+        if i >= chars.len() { break; }
     }
     out
 }
@@ -258,7 +260,7 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-fn resolve_provider_config(provider: &str, cfg: Option<&Value>) -> (Option<String>, Option<String>) {
+pub(crate) fn resolve_provider_config(provider: &str, cfg: Option<&Value>) -> (Option<String>, Option<String>) {
     let p = provider.to_ascii_lowercase();
     let api_key = cfg_str(cfg, "api_key").or_else(|| match p.as_str() {
         "openai" => env_nonempty("OPENAI_API_KEY"),
@@ -301,6 +303,64 @@ fn resolve_provider_config(provider: &str, cfg: Option<&Value>) -> (Option<Strin
     (api_key, base_url)
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
+}
+
+pub(crate) fn infer_model_type(provider: &str, name: &str) -> &'static str {
+    // ponytail: heuristic classification for discovery/sync; provider catalogs can override later.
+    let n = name.to_ascii_lowercase();
+    let p = provider.to_ascii_lowercase();
+    if n.contains("embed") || p == "voyage" {
+        return "embedding";
+    }
+    if n.contains("whisper")
+        || n.contains("transcrib")
+        || n.contains("speech-to-text")
+        || n.contains("stt")
+        || n.contains("asr")
+        || p == "deepgram"
+    {
+        return "speech_to_text";
+    }
+    if n.contains("tts")
+        || n.contains("text-to-speech")
+        || (p == "elevenlabs" && !n.contains("scribe"))
+        || (n.contains("speech") && !n.contains("to-text") && !n.contains("transcrib") && !n.contains("stt"))
+    {
+        return "text_to_speech";
+    }
+    "language"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_pgvector_formats_empty_and_values() {
+        assert_eq!(to_pgvector(&[]), "[]");
+        assert_eq!(to_pgvector(&[1.0, -2.5, 0.0]), "[1,-2.5,0]");
+    }
+
+    #[test]
+    fn chunk_text_handles_empty_short_and_overlap_progress() {
+        assert!(chunk_text("", 10, 2).is_empty());
+        assert_eq!(chunk_text("  hi  ", 10, 2), vec!["hi"]);
+        assert_eq!(chunk_text("abcdef", 3, 1), vec!["abc", "cde", "ef"]);
+        assert_eq!(chunk_text("abcd", 2, 5), vec!["ab", "bc", "cd"]);
+        assert_eq!(chunk_text("ab", 0, 0), vec!["a", "b"]); // ponytail: chunk_chars clamped to 1
+    }
+
+    #[test]
+    fn infer_model_type_classifies_common_cases() {
+        assert_eq!(infer_model_type("openai", "text-embedding-3-small"), "embedding");
+        assert_eq!(infer_model_type("voyage", "voyage-large-2"), "embedding");
+        assert_eq!(infer_model_type("openai", "whisper-1"), "speech_to_text");
+        assert_eq!(infer_model_type("deepgram", "nova-2"), "speech_to_text");
+        assert_eq!(infer_model_type("openai", "tts-1"), "text_to_speech");
+        assert_eq!(infer_model_type("openai", "gpt-4o"), "language");
+        assert_eq!(infer_model_type("elevenlabs", "eleven_multilingual_v2"), "text_to_speech");
+        assert_eq!(infer_model_type("elevenlabs", "scribe_v1"), "language");
+    }
 }

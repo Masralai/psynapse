@@ -1,7 +1,7 @@
-use axum::{extract::DefaultBodyLimit, middleware};
+use axum::{extract::DefaultBodyLimit, http::HeaderValue, middleware};
 use psynapse_api::{auth, config::Config, db, routes, state::AppState};
 use std::net::SocketAddr;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -28,14 +28,26 @@ async fn main() -> anyhow::Result<()> {
         pool,
         app_password: config.app_password.clone(),
     };
-    // ponytail: permissive CORS + coarse body limit/auth gate; runtime hardening/CORS policy parity pending.
+    // ponytail: configurable CORS origins via env with permissive fallback; full CORS/auth policy parity pending.
+    let cors = {
+        let origins: Vec<HeaderValue> = config.cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
+        if origins.is_empty() {
+            CorsLayer::permissive()
+        } else {
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+    };
+
     let app = routes::api_routes(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_password,
         ))
         .layer(DefaultBodyLimit::max(config.max_upload_size_bytes))
-        .layer(CorsLayer::permissive());
+        .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
     tracing::info!("listening on {}", addr);

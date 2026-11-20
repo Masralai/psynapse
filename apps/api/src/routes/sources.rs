@@ -349,17 +349,84 @@ async fn download_source_file(
     let path_str = asset.file_path.ok_or_else(|| AppError::Http(StatusCode::NOT_FOUND, "No file available".into()))?;
     let path = FsPath::new(&path_str);
     if !in_uploads(path) || !path.exists() { return Err(AppError::Http(StatusCode::NOT_FOUND, "File not found".into())); }
-    if req.method() == Method::HEAD {
-        return Ok(Response::builder().status(StatusCode::OK).body(axum::body::Body::empty()).unwrap());
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("download.bin").to_string();
+    let meta = tokio::fs::metadata(path).await.map_err(|_| AppError::Http(StatusCode::NOT_FOUND, "File not found".into()))?;
+    let total = meta.len();
+    let range = match req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        Some(h) => parse_single_byte_range(h, total),
+        None => ByteRange::None,
+    };
+    if matches!(range, ByteRange::Unsatisfiable) {
+        return Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(axum::body::Body::empty())
+            .unwrap());
     }
+
+    let ct = content_type_for(&filename);
+    let safe_name = filename.replace('"', "_");
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, ct)
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{safe_name}\""))
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if req.method() == Method::HEAD {
+        let (status, len, cr) = match range {
+            ByteRange::Partial(s,e) => (StatusCode::PARTIAL_CONTENT, e - s + 1, Some(format!("bytes {s}-{e}/{total}"))),
+            _ => (StatusCode::OK, total, None),
+        };
+        builder = builder.status(status).header(header::CONTENT_LENGTH, len.to_string());
+        if let Some(cr) = cr { builder = builder.header(header::CONTENT_RANGE, cr); }
+        return Ok(builder.body(axum::body::Body::empty()).unwrap());
+    }
+
+    // ponytail: read full file then slice for ranges (simple; streaming/seek optimization if large files matter).
     let bytes = tokio::fs::read(path).await.map_err(|_| AppError::Http(StatusCode::NOT_FOUND, "File not found".into()))?;
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("download.bin");
-    Ok(Response::builder()
+    if let ByteRange::Partial(s,e) = range {
+        let start = s as usize;
+        let end = (e as usize).saturating_add(1).min(bytes.len());
+        let slice = bytes.get(start..end).unwrap_or(&[]).to_vec();
+        return Ok(builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_LENGTH, slice.len().to_string())
+            .header(header::CONTENT_RANGE, format!("bytes {s}-{e}/{total}"))
+            .body(axum::body::Body::from(slice))
+            .unwrap());
+    }
+    Ok(builder
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
         .body(axum::body::Body::from(bytes))
         .unwrap())
+}
+
+enum ByteRange { None, Partial(u64, u64), Unsatisfiable }
+
+fn parse_single_byte_range(h: &str, total: u64) -> ByteRange {
+    // ponytail: single byte range only; malformed/multi-range ignored (full), unsatisfiable -> 416.
+    if total == 0 { return ByteRange::Unsatisfiable; }
+    let h = h.trim();
+    let Some(spec) = h.strip_prefix("bytes=") else { return ByteRange::None; };
+    if spec.contains(',') { return ByteRange::None; }
+    let Some((a,b)) = spec.split_once('-') else { return ByteRange::None; };
+    let (start,end) = if a.trim().is_empty() {
+        let Ok(suffix) = b.trim().parse::<u64>() else { return ByteRange::None; };
+        if suffix == 0 { return ByteRange::None; }
+        let len = suffix.min(total);
+        (total - len, total - 1)
+    } else {
+        let Ok(start) = a.trim().parse::<u64>() else { return ByteRange::None; };
+        if start >= total { return ByteRange::Unsatisfiable; }
+        let end = if b.trim().is_empty() { total - 1 } else {
+            let Ok(e) = b.trim().parse::<u64>() else { return ByteRange::None; };
+            e.min(total - 1)
+        };
+        if end < start { return ByteRange::None; }
+        (start, end)
+    };
+    ByteRange::Partial(start, end)
 }
 
 async fn create_source_json(
@@ -648,4 +715,33 @@ async fn create_source_insight(
             command_id: Some(cid.to_string()),
         }),
     ))
+}
+
+
+fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "pdf" => "application/pdf",
+        "txt" => "text/plain; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "json" => "application/json",
+        "csv" => "text/csv; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "mp4a" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
 }

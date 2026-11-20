@@ -93,6 +93,8 @@ async fn episode_to_response(state: &AppState, r: &sqlx::postgres::PgRow) -> Val
         "transcript": r.try_get::<Option<Value>,_>("transcript").ok().flatten(),
         "outline": r.try_get::<Option<Value>,_>("outline").ok().flatten(),
         "created": created.map(|t| t.to_rfc3339()),
+        "command_id": command_id.map(|u| u.to_string()),
+        "job_id": command_id.map(|u| u.to_string()),
         "job_status": job_status.or_else(|| if r.try_get::<Option<String>,_>("audio_file").ok().flatten().is_some() { Some("completed".into()) } else { Some("unknown".into()) }),
         "error_message": error_message,
     })
@@ -252,17 +254,96 @@ async fn stream_episode_audio(
     if !canon.starts_with(&root) || !path.exists() {
         return Err(AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into()));
     }
-    // ponytail: containment check + basic serving; full range/streaming parity pending.
-    if req.method() == Method::HEAD {
-        return Ok(Response::builder().status(StatusCode::OK).body(Body::empty()).unwrap());
+    let meta = tokio::fs::metadata(&path).await.map_err(|_| AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into()))?;
+    let total = meta.len();
+    let ct = content_type_for(&af);
+    let range = match req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        Some(h) => parse_single_byte_range(h, total),
+        None => ByteRange::None,
+    };
+    if matches!(range, ByteRange::Unsatisfiable) {
+        return Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(Body::empty())
+            .unwrap());
     }
-    let bytes = tokio::fs::read(&path).await.map_err(|_| AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into()))?;
-    let ct = if af.to_ascii_lowercase().ends_with(".wav") { "audio/wav" } else { "audio/mpeg" };
-    Ok(Response::builder()
-        .status(StatusCode::OK)
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, ct)
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if req.method() == Method::HEAD {
+        let (status, len, cr) = match range {
+            ByteRange::Partial(s,e) => (StatusCode::PARTIAL_CONTENT, e - s + 1, Some(format!("bytes {s}-{e}/{total}"))),
+            _ => (StatusCode::OK, total, None),
+        };
+        builder = builder.status(status).header(header::CONTENT_LENGTH, len.to_string());
+        if let Some(cr) = cr { builder = builder.header(header::CONTENT_RANGE, cr); }
+        return Ok(builder.body(Body::empty()).unwrap());
+    }
+
+    // ponytail: read full file then slice for ranges (simple; true streaming/range parity if needed).
+    let bytes = tokio::fs::read(&path).await.map_err(|_| AppError::Http(StatusCode::NOT_FOUND, "Audio file not found".into()))?;
+    if let ByteRange::Partial(s,e) = range {
+        let start = s as usize;
+        let end = (e as usize).saturating_add(1).min(bytes.len());
+        let slice = bytes.get(start..end).unwrap_or(&[]).to_vec();
+        return Ok(builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_LENGTH, slice.len().to_string())
+            .header(header::CONTENT_RANGE, format!("bytes {s}-{e}/{total}"))
+            .body(Body::from(slice))
+            .unwrap());
+    }
+    Ok(builder
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
         .body(Body::from(bytes))
         .unwrap())
+}
+
+enum ByteRange { None, Partial(u64, u64), Unsatisfiable }
+
+fn parse_single_byte_range(h: &str, total: u64) -> ByteRange {
+    // ponytail: single byte range only; malformed/multi-range ignored (full), unsatisfiable -> 416.
+    if total == 0 { return ByteRange::Unsatisfiable; }
+    let h = h.trim();
+    let Some(spec) = h.strip_prefix("bytes=") else { return ByteRange::None; };
+    if spec.contains(',') { return ByteRange::None; }
+    let Some((a,b)) = spec.split_once('-') else { return ByteRange::None; };
+    let (start,end) = if a.trim().is_empty() {
+        let Ok(suffix) = b.trim().parse::<u64>() else { return ByteRange::None; };
+        if suffix == 0 { return ByteRange::None; }
+        let len = suffix.min(total);
+        (total - len, total - 1)
+    } else {
+        let Ok(start) = a.trim().parse::<u64>() else { return ByteRange::None; };
+        if start >= total { return ByteRange::Unsatisfiable; }
+        let end = if b.trim().is_empty() { total - 1 } else {
+            let Ok(e) = b.trim().parse::<u64>() else { return ByteRange::None; };
+            e.min(total - 1)
+        };
+        if end < start { return ByteRange::None; }
+        (start, end)
+    };
+    ByteRange::Partial(start, end)
+}
+
+
+
+fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "mp4a" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "webm" => "audio/webm",
+        _ => "audio/mpeg",
+    }
 }
 
 async fn list_languages() -> Json<Vec<Language>> {

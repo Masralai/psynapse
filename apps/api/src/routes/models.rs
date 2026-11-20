@@ -217,15 +217,58 @@ async fn get_providers(State(state): State<AppState>) -> Result<Json<Value>, App
     Ok(Json(json!({"available": available, "unavailable": unavailable, "supported_types": supported_types})))
 }
 
-async fn discover_models(Path(_provider): Path<String>) -> Json<Value> {
-    // ponytail: provider discovery requires external API calls; return empty until provider pipeline lands.
-    Json(json!([]))
+async fn discover_models(State(state): State<AppState>, Path(provider): Path<String>) -> Result<Json<Vec<Value>>, AppError> {
+    // ponytail: best-effort discovery from first credential/config for provider via OpenAI-compatible /models.
+    let cred = sqlx::query("SELECT config FROM credentials WHERE lower(provider)=lower($1) ORDER BY updated_at DESC LIMIT 1")
+        .bind(&provider).fetch_optional(&state.pool).await?;
+    let cfg = cred.and_then(|r| r.try_get::<Value,_>("config").ok()).and_then(|v| crate::crypto::decrypt_config(&v).ok());
+    let names = discover_remote_model_names(&provider, cfg.as_ref()).await;
+    let discovered = names.into_iter().map(|name| json!({
+        "name": name,
+        "provider": provider,
+        "model_type": crate::providers::infer_model_type(&provider, &name),
+        "description": Value::Null
+    })).collect();
+    Ok(Json(discovered))
 }
-async fn sync_provider(Path(provider): Path<String>) -> Json<Value> {
-    Json(json!({"provider": provider, "discovered": 0, "new": 0, "existing": 0}))
+
+async fn sync_provider(State(state): State<AppState>, Path(provider): Path<String>) -> Result<Json<Value>, AppError> {
+    let Json(discovered) = discover_models(State(state.clone()), Path(provider.clone())).await?;
+    let cred_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM credentials WHERE lower(provider)=lower($1) ORDER BY updated_at DESC LIMIT 1")
+        .bind(&provider).fetch_optional(&state.pool).await?;
+    let mut created = 0i64; let mut existing = 0i64;
+    for m in &discovered {
+        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let mtype = m.get("model_type").and_then(|v| v.as_str()).unwrap_or("language");
+        if name.is_empty() { continue; }
+        let dup = sqlx::query_scalar::<_, i64>("SELECT 1 FROM models WHERE lower(provider)=lower($1) AND lower(name)=lower($2) AND lower(type)=lower($3) LIMIT 1")
+            .bind(&provider).bind(name).bind(mtype).fetch_optional(&state.pool).await?;
+        if dup.is_some() { existing += 1; continue; }
+        sqlx::query("INSERT INTO models (name, provider, type, credential_id) VALUES ($1,$2,$3,$4)")
+            .bind(name).bind(&provider).bind(mtype).bind(cred_id).execute(&state.pool).await?;
+        created += 1;
+    }
+    Ok(Json(json!({"provider": provider, "discovered": discovered.len(), "new": created, "existing": existing})))
 }
-async fn sync_all() -> Json<Value> {
-    Json(json!({"results": {}, "total_discovered": 0, "total_new": 0}))
+
+async fn sync_all(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    // ponytail: sync stored-credential providers plus env-configured providers (best-effort).
+    let mut providers: Vec<String> = sqlx::query_scalar("SELECT DISTINCT lower(provider) FROM credentials")
+        .fetch_all(&state.pool).await.unwrap_or_default();
+    for p in env_configured_provider_names() {
+        if !providers.iter().any(|x| x == &p) { providers.push(p); }
+    }
+    providers.sort();
+    providers.dedup();
+    let mut results = serde_json::Map::new();
+    let mut total_discovered = 0i64; let mut total_new = 0i64;
+    for p in providers {
+        let Json(r) = sync_provider(State(state.clone()), Path(p.clone())).await?;
+        total_discovered += r.get("discovered").and_then(|v| v.as_i64()).unwrap_or(0);
+        total_new += r.get("new").and_then(|v| v.as_i64()).unwrap_or(0);
+        results.insert(p, r);
+    }
+    Ok(Json(json!({"results": results, "total_discovered": total_discovered, "total_new": total_new})))
 }
 async fn model_count(State(state): State<AppState>, Path(provider): Path<String>) -> Result<Json<Value>, AppError> {
     let rows = sqlx::query("SELECT type, COUNT(*)::bigint as c FROM models WHERE lower(provider)=lower($1) GROUP BY type")
@@ -271,8 +314,9 @@ async fn auto_assign(State(state): State<AppState>) -> Result<Json<Value>, AppEr
             skipped.push(slot.to_string());
             continue;
         }
+        // ponytail: prefer models linked to credentials, then stable order.
         let row = sqlx::query(
-            "SELECT id::text as id FROM models WHERE type=$1 ORDER BY created_at ASC, provider ASC, name ASC LIMIT 1",
+            "SELECT id::text as id FROM models WHERE type=$1 ORDER BY (credential_id IS NOT NULL) DESC, created_at ASC, provider ASC, name ASC LIMIT 1",
         )
         .bind(mtype)
         .fetch_optional(&state.pool)
@@ -310,4 +354,63 @@ async fn test_model(State(state): State<AppState>, Path(id): Path<String>) -> Js
         Ok(out) => Json(json!({"success": true, "message": "Model call succeeded", "details": out.chars().take(200).collect::<String>()})),
         Err(e) => Json(json!({"success": false, "message": e.to_string()})),
     }
+}
+
+
+fn env_configured_provider_names() -> Vec<String> {
+    let checks: [(&str, &[&str]); 14] = [
+        ("openai", &["OPENAI_API_KEY"]),
+        ("anthropic", &["ANTHROPIC_API_KEY"]),
+        ("google", &["GOOGLE_API_KEY", "GEMINI_API_KEY"]),
+        ("groq", &["GROQ_API_KEY"]),
+        ("mistral", &["MISTRAL_API_KEY"]),
+        ("deepseek", &["DEEPSEEK_API_KEY"]),
+        ("xai", &["XAI_API_KEY"]),
+        ("openrouter", &["OPENROUTER_API_KEY"]),
+        ("voyage", &["VOYAGE_API_KEY"]),
+        ("ollama", &["OLLAMA_API_BASE"]),
+        ("omlx", &["OMLX_API_BASE"]),
+        ("openai_compatible", &["OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_BASE_URL_LLM"]),
+        ("azure", &["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]),
+        ("anthropic_compatible", &["ANTHROPIC_COMPATIBLE_BASE_URL"]),
+    ];
+    checks.into_iter().filter_map(|(p, keys)| {
+        if keys.iter().any(|k| std::env::var(k).ok().map(|v| !v.trim().is_empty()).unwrap_or(false)) {
+            Some(p.to_string())
+        } else { None }
+    }).collect()
+}
+
+
+async fn discover_remote_model_names(provider: &str, cfg: Option<&Value>) -> Vec<String> {
+    // ponytail: best-effort OpenAI-compatible /models discovery only.
+    let (api_key, base_url) = crate::providers::resolve_provider_config(provider, cfg);
+    let Some(base_url) = base_url else { return vec![]; };
+    let mut candidates = vec![format!("{}/models", base_url.trim_end_matches('/'))];
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        if let Some(b) = base.strip_suffix("/v1") { candidates.push(format!("{b}/models")); }
+    }
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+        Ok(c) => c, Err(_) => return vec![],
+    };
+    for url in candidates {
+        let mut req = client.get(&url);
+        if let Some(key) = &api_key { req = req.bearer_auth(key); }
+        let resp = match req.send().await { Ok(r) => r, Err(_) => continue };
+        if !resp.status().is_success() { continue; }
+        let body = match resp.json::<Value>().await { Ok(v) => v, Err(_) => continue };
+        let arr = body.get("data").and_then(|d| d.as_array())
+            .or_else(|| body.get("models").and_then(|d| d.as_array()))
+            .or_else(|| body.as_array());
+        let Some(arr) = arr else { continue; };
+        let mut names: Vec<String> = arr.iter().filter_map(|m| {
+            m.get("id").and_then(|v| v.as_str()).or_else(|| m.get("name").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+        }).collect();
+        names.sort();
+        names.dedup();
+        if !names.is_empty() { return names; }
+    }
+    vec![]
 }

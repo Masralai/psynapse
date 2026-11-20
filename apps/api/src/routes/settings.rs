@@ -90,3 +90,50 @@ async fn update_settings(
     .await?;
     Ok(Json(merged))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn settings_defaults_match_expected_baseline() {
+        let s = SettingsResponse::defaults();
+        assert_eq!(s.default_content_processing_engine_doc.as_deref(), Some("auto"));
+        assert_eq!(s.default_content_processing_engine_url.as_deref(), Some("auto"));
+        assert_eq!(s.default_embedding_option.as_deref(), Some("ask"));
+        assert_eq!(s.auto_delete_files.as_deref(), Some("yes"));
+        assert_eq!(s.docling_ocr, Some(true));
+        assert_eq!(s.docling_formulas, Some(false));
+        assert_eq!(s.docling_vision, Some(false));
+        let langs = s.youtube_preferred_languages.unwrap();
+        assert!(langs.contains(&"en".to_string()));
+        assert!(langs.len() >= 5);
+    }
+
+    #[test]
+    fn settings_merge_applies_present_fields_and_allows_null_string_override() {
+        let base = SettingsResponse::defaults();
+        let merged = base.clone().merge(json!({
+            "default_embedding_option": "always",
+            "docling_ocr": false,
+            "youtube_preferred_languages": ["en", "fr"],
+            "auto_delete_files": null
+        }));
+        assert_eq!(merged.default_embedding_option.as_deref(), Some("always"));
+        assert_eq!(merged.docling_ocr, Some(false));
+        assert_eq!(merged.youtube_preferred_languages, Some(vec!["en".into(), "fr".into()]));
+        assert_eq!(merged.auto_delete_files, None); // ponytail: key present + non-string => cleared
+        // untouched defaults preserved
+        assert_eq!(merged.default_content_processing_engine_doc, base.default_content_processing_engine_doc);
+    }
+
+    #[test]
+    fn settings_merge_ignores_unknown_and_non_object_values() {
+        let base = SettingsResponse::defaults();
+        let merged = base.clone().merge(json!(["not", "an", "object"]));
+        assert_eq!(merged.default_embedding_option, base.default_embedding_option);
+        let merged = base.clone().merge(json!({"unknown_key": "x"}));
+        assert_eq!(merged.default_embedding_option, base.default_embedding_option);
+    }
+}

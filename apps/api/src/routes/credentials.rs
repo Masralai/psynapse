@@ -247,22 +247,45 @@ async fn delete_credential(State(state): State<AppState>, Path(id): Path<String>
 
 async fn test_credential(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
     let id = Uuid::parse_str(&id).map_err(|_| AppError::NotFound)?;
-    let row = sqlx::query("SELECT provider FROM credentials WHERE id=$1").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT provider, config FROM credentials WHERE id=$1").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
     let provider: String = row.get("provider");
-    // ponytail: credential-level test without a specific model is not fully implemented; report configuration presence.
-    let has_model = sqlx::query_scalar::<_, i64>("SELECT 1 FROM models WHERE credential_id=$1 LIMIT 1").bind(id).fetch_optional(&state.pool).await?.is_some();
-    let msg = if has_model {
-        "Credential saved. Run a model test for a linked model to verify connectivity."
+    let stored_cfg: Value = row.try_get("config").unwrap_or_else(|_| json!({}));
+    let cfg = crate::crypto::decrypt_config(&stored_cfg).map_err(|e| AppError::BadRequest(format!("Credential decryption failed: {e}")))?;
+    let (api_key, base_url) = crate::providers::resolve_provider_config(&provider, Some(&cfg));
+
+    // ponytail: prefer testing a linked language model for real connectivity; fallback to config/readiness check.
+    let model_row = sqlx::query("SELECT id::text as id, type FROM models WHERE credential_id=$1 ORDER BY CASE WHEN type='language' THEN 0 ELSE 1 END, created_at ASC LIMIT 1")
+        .bind(id).fetch_optional(&state.pool).await?;
+    if let Some(mr) = model_row {
+        let mid: String = mr.get("id");
+        let mtype: String = mr.get("type");
+        if mtype == "language" {
+            return match crate::providers::chat_completion(&state.pool, Some(&mid), None, "You are a test helper.", "Reply with exactly: OK").await {
+                Ok(out) => Ok(Json(json!({"provider": provider, "success": true, "message": "Credential/model connectivity verified", "details": crate::providers::truncate(&out, 120)}))),
+                Err(e) => Ok(Json(json!({"provider": provider, "success": false, "message": e.to_string()}))),
+            };
+        }
+    }
+    if base_url.is_some() || api_key.is_some() || provider.eq_ignore_ascii_case("ollama") || provider.eq_ignore_ascii_case("omlx") {
+        Ok(Json(json!({"provider": provider, "success": true, "message": "Credential configuration looks valid. Add/link a language model and run model test for full connectivity verification."})))
     } else {
-        "Credential saved. Add/link a model and run model test to verify connectivity."
-    };
-    Ok(Json(json!({"provider": provider, "success": true, "message": msg})))
+        Ok(Json(json!({"provider": provider, "success": false, "message": "No API key/base URL configured for this credential/provider."})))
+    }
 }
 async fn discover_models(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
     let id = Uuid::parse_str(&id).map_err(|_| AppError::NotFound)?;
-    let row = sqlx::query("SELECT provider FROM credentials WHERE id=$1").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT provider, config FROM credentials WHERE id=$1").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
     let provider: String = row.get("provider");
-    Ok(Json(json!({"credential_id": id.to_string(), "provider": provider, "discovered": []})))
+    let stored_cfg: Value = row.try_get("config").unwrap_or_else(|_| json!({}));
+    let cfg = crate::crypto::decrypt_config(&stored_cfg).unwrap_or_else(|_| json!({}));
+    let names = discover_remote_model_names(&provider, Some(&cfg)).await;
+    let discovered: Vec<Value> = names.into_iter().map(|name| json!({
+        "name": name,
+        "provider": provider,
+        "model_type": crate::providers::infer_model_type(&provider, &name),
+        "description": null
+    })).collect();
+    Ok(Json(json!({"credential_id": id.to_string(), "provider": provider, "discovered": discovered})))
 }
 async fn register_models(State(state): State<AppState>, Path(id): Path<String>, Json(p): Json<Value>) -> Result<Json<Value>, AppError> {
     let cid = Uuid::parse_str(&id).map_err(|_| AppError::NotFound)?;
@@ -286,4 +309,39 @@ async fn register_models(State(state): State<AppState>, Path(id): Path<String>, 
 }
 async fn migrate_stub() -> Json<Value> {
     Json(json!({"message":"Migration not applicable in Rust port yet","migrated":[],"skipped":[],"errors":[]}))
+}
+
+
+
+async fn discover_remote_model_names(provider: &str, cfg: Option<&Value>) -> Vec<String> {
+    // ponytail: best-effort OpenAI-compatible /models discovery; no provider-specific catalogs/auth flows.
+    let (api_key, base_url) = crate::providers::resolve_provider_config(provider, cfg);
+    let Some(base_url) = base_url else { return vec![]; };
+    let mut candidates = vec![format!("{}/models", base_url.trim_end_matches('/'))];
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        if let Some(b) = base.strip_suffix("/v1") { candidates.push(format!("{b}/models")); }
+    }
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+        Ok(c) => c, Err(_) => return vec![],
+    };
+    for url in candidates {
+        let mut req = client.get(&url);
+        if let Some(key) = &api_key { req = req.bearer_auth(key); }
+        let resp = match req.send().await { Ok(r) => r, Err(_) => continue };
+        if !resp.status().is_success() { continue; }
+        let body = match resp.json::<Value>().await { Ok(v) => v, Err(_) => continue };
+        let arr = body.get("data").and_then(|d| d.as_array())
+            .or_else(|| body.get("models").and_then(|d| d.as_array()))
+            .or_else(|| body.as_array());
+        let Some(arr) = arr else { continue; };
+        let mut names: Vec<String> = arr.iter().filter_map(|m| {
+            m.get("id").and_then(|v| v.as_str()).or_else(|| m.get("name").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+        }).collect();
+        names.sort();
+        names.dedup();
+        if !names.is_empty() { return names; }
+    }
+    vec![]
 }

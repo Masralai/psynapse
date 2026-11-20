@@ -290,20 +290,32 @@ async fn send_message(
 }
 
 fn chunk_sse_content(s: &str, max_chars: usize) -> Vec<String> {
-    if s.is_empty() { return vec![String::new()]; }
+    if s.is_empty() { return vec![]; }
+    let max = max_chars.max(1);
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut n = 0usize;
     for ch in s.chars() {
         cur.push(ch);
         n += 1;
-        if n >= max_chars {
+        if n >= max {
             out.push(std::mem::take(&mut cur));
             n = 0;
         }
     }
-    if !cur.is_empty() || out.is_empty() { out.push(cur); }
-    out.into_iter().filter(|c| !c.is_empty() || out_is_single_placeholder(c)).collect::<Vec<_>>()
+    if !cur.is_empty() { out.push(cur); }
+    out
 }
 
-fn out_is_single_placeholder(_c: &str) -> bool { false }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_sse_content_splits_by_char_count() {
+        assert!(chunk_sse_content("", 5).is_empty());
+        assert_eq!(chunk_sse_content("abc", 5), vec!["abc"]);
+        assert_eq!(chunk_sse_content("abcdef", 3), vec!["abc", "def"]);
+        assert_eq!(chunk_sse_content("abcdefg", 3), vec!["abc", "def", "g"]);
+    }
+}
