@@ -30,6 +30,20 @@ pub fn parse_job_id(s: &str) -> Result<Uuid, AppError> {
     Uuid::parse_str(s).map_err(|_| AppError::NotFound)
 }
 
+async fn job_canceled(pool: &PgPool, id: Uuid) -> bool {
+    // ponytail: cooperative cancellation check for long-running handlers.
+    matches!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id=$1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("canceled") | Some("cancelled")
+    )
+}
+
 pub async fn status_payload(pool: &PgPool, job_id: Uuid) -> Result<Value, AppError> {
     let row = sqlx::query(
         r#"
@@ -124,7 +138,7 @@ async fn process_next(pool: &PgPool) -> Result<bool, sqlx::Error> {
     let input: Value = job.get("input");
     touch_source_running(pool, &cmd, &input).await;
 
-    match dispatch(pool, &cmd, &input).await {
+    match dispatch(pool, id, &cmd, &input).await {
         Ok(result) => {
             let updated = sqlx::query(
                 "UPDATE jobs SET status='completed', result=$2, error_message=NULL, completed_at=NOW() WHERE id=$1 AND status='running'",
@@ -201,14 +215,17 @@ fn source_id(input: &Value) -> Option<Uuid> {
         .and_then(|s| Uuid::parse_str(s).ok())
 }
 
-async fn dispatch(pool: &PgPool, command: &str, input: &Value) -> Result<Value, String> {
+async fn dispatch(pool: &PgPool, job_id: Uuid, command: &str, input: &Value) -> Result<Value, String> {
+    if job_canceled(pool, job_id).await {
+        return Err("canceled".into());
+    }
     match command {
-        "process_source" => process_source(pool, input).await,
+        "process_source" => process_source(pool, job_id, input).await,
         "embed_source" => embed_source_job(pool, input).await,
         "embed_note" => embed_note_job(pool, input).await,
-        "rebuild_embeddings" => rebuild_embeddings_job(pool, input).await,
+        "rebuild_embeddings" => rebuild_embeddings_job(pool, job_id, input).await,
         "run_transformation" => run_transformation_job(pool, input).await,
-        "generate_podcast" => generate_podcast_job(pool, input).await,
+        "generate_podcast" => generate_podcast_job(pool, job_id, input).await,
         _ => Ok(json!({"skipped": true, "command": command})),
     }
 }
@@ -241,7 +258,7 @@ async fn embed_note_job(pool: &PgPool, input: &Value) -> Result<Value, String> {
     }
 }
 
-async fn rebuild_embeddings_job(pool: &PgPool, input: &Value) -> Result<Value, String> {
+async fn rebuild_embeddings_job(pool: &PgPool, job_id: Uuid, input: &Value) -> Result<Value, String> {
     // ponytail: sequential inline rebuild using default embedding model; no per-item subjobs/progress streaming.
     let include_sources = input.get("include_sources").and_then(|v| v.as_bool()).unwrap_or(true);
     let include_notes = input.get("include_notes").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -257,6 +274,7 @@ async fn rebuild_embeddings_job(pool: &PgPool, input: &Value) -> Result<Value, S
         let rows = sqlx::query("SELECT id FROM sources WHERE full_text IS NOT NULL AND btrim(full_text) <> ''")
             .fetch_all(pool).await.map_err(|e| e.to_string())?;
         for r in rows {
+            if job_canceled(pool, job_id).await { return Err("canceled".into()); }
             let id: Uuid = r.get("id");
             match embed_source_by_id(pool, id).await {
                 Ok(_) => { sources += 1; processed += 1; }
@@ -269,6 +287,7 @@ async fn rebuild_embeddings_job(pool: &PgPool, input: &Value) -> Result<Value, S
         let rows = sqlx::query("SELECT id FROM notes WHERE content IS NOT NULL AND btrim(content) <> ''")
             .fetch_all(pool).await.map_err(|e| e.to_string())?;
         for r in rows {
+            if job_canceled(pool, job_id).await { return Err("canceled".into()); }
             let id: Uuid = r.get("id");
             match embed_note_by_id(pool, id).await {
                 Ok(_) => { notes += 1; processed += 1; }
@@ -281,6 +300,7 @@ async fn rebuild_embeddings_job(pool: &PgPool, input: &Value) -> Result<Value, S
         let rows = sqlx::query("SELECT id FROM source_insights WHERE content IS NOT NULL AND btrim(content) <> ''")
             .fetch_all(pool).await.map_err(|e| e.to_string())?;
         for r in rows {
+            if job_canceled(pool, job_id).await { return Err("canceled".into()); }
             let id: Uuid = r.get("id");
             match embed_insight_by_id(pool, id).await {
                 Ok(_) => { insights += 1; processed += 1; }
@@ -477,7 +497,7 @@ async fn run_transformation_job(pool: &PgPool, input: &Value) -> Result<Value, S
     Ok(json!({"status":"completed","insight_id": iid.to_string(), "source_id": sid.to_string()}))
 }
 
-async fn process_source(pool: &PgPool, input: &Value) -> Result<Value, String> {
+async fn process_source(pool: &PgPool, job_id: Uuid, input: &Value) -> Result<Value, String> {
     let sid = source_id(input).ok_or_else(|| "missing source_id".to_string())?;
     let cs = input.get("content_state").cloned().unwrap_or_else(|| json!({}));
     let (mut full_text, note, mut inferred_title) = extract_content(&cs).await?;
@@ -524,6 +544,7 @@ async fn process_source(pool: &PgPool, input: &Value) -> Result<Value, String> {
     let mut embedded_chunks: Option<i64> = None;
     let mut insights_created: Vec<String> = Vec::new();
     if let Some(text) = &full_text {
+        if job_canceled(pool, job_id).await { return Err("canceled".into()); }
         if input.get("embed").and_then(|v| v.as_bool()).unwrap_or(false) {
             match embed_source_by_id(pool, sid).await {
                 Ok(n) => embedded_chunks = Some(n),
@@ -532,6 +553,7 @@ async fn process_source(pool: &PgPool, input: &Value) -> Result<Value, String> {
         }
         if let Some(tids) = input.get("transformations").and_then(|v| v.as_array()) {
             for tval in tids {
+                if job_canceled(pool, job_id).await { return Err("canceled".into()); }
                 if let Some(tid_str) = tval.as_str() {
                     if let Ok(tid) = Uuid::parse_str(tid_str) {
                         match run_transformation_inline(pool, sid, tid, text).await {
@@ -599,6 +621,10 @@ async fn extract_content(cs: &Value) -> Result<(Option<String>, String, Option<S
 }
 
 fn normalize_text_content(raw: &str, source_kind: &str, ext_hint: Option<&str>) -> (Option<String>, String) {
+    normalize_text_content_with_max(raw, source_kind, ext_hint, max_extract_bytes())
+}
+
+fn normalize_text_content_with_max(raw: &str, source_kind: &str, ext_hint: Option<&str>, max: usize) -> (Option<String>, String) {
     let mut text = raw.to_string();
     let mut notes: Vec<String> = vec![format!("{source_kind} content extracted")];
     let ext = ext_hint.unwrap_or("").to_ascii_lowercase();
@@ -609,7 +635,6 @@ fn normalize_text_content(raw: &str, source_kind: &str, ext_hint: Option<&str>) 
             notes.push("html stripped to text".into());
         }
     }
-    let max = max_extract_bytes();
     if text.len() > max {
         let mut cut = max.min(text.len());
         while cut > 0 && !text.is_char_boundary(cut) {
@@ -742,7 +767,7 @@ fn html_to_text(html: &str) -> String {
                     "br" | "br/" | "p" | "/p" | "div" | "/div" | "li" | "/li" | "tr" | "/tr"
                         | "h1" | "/h1" | "h2" | "/h2" | "h3" | "/h3" | "h4" | "/h4"
                         | "h5" | "/h5" | "h6" | "/h6" | "section" | "/section"
-                        | "article" | "/article"
+                        | "article" | "/article" | "ul" | "/ul" | "ol" | "/ol"
                 ) {
                     out.push('\n');
                 }
@@ -756,14 +781,51 @@ fn html_to_text(html: &str) -> String {
             _ => {}
         }
     }
-    let normalized = out
+    let decoded = out
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'");
+    let mut result = String::with_capacity(decoded.len());
+    let mut last_was_space = false;
+    let mut nl_run = 0usize;
+    for ch in decoded.chars() {
+        if ch == '\n' || ch == '\r' {
+            nl_run += 1;
+            last_was_space = false;
+            continue;
+        }
+        if nl_run > 0 {
+            let n = if nl_run >= 2 { 2 } else { 1 };
+            for _ in 0..n { result.push('\n'); }
+            nl_run = 0;
+            last_was_space = false;
+        }
+        if ch.is_whitespace() {
+            if !last_was_space {
+                result.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_space = false;
+        }
+    }
+    if nl_run > 0 {
+        let n = if nl_run >= 2 { 2 } else { 1 };
+        for _ in 0..n { result.push('\n'); }
+    }
+    // ponytail: preserve block breaks, collapse inline whitespace.
+    result
+        .lines()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option<String>), String> {
@@ -788,15 +850,48 @@ async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option
             title,
         ));
     }
-
-    let likely_text = matches!(
-        ext.as_str(),
-        "txt"|"md"|"markdown"|"csv"|"json"|"xml"|"html"|"htm"|"yaml"|"yml"|"log"|"rs"|"py"|"js"|"ts"|"tsx"|"jsx"|"go"|"java"|"c"|"cpp"|"h"|"toml"|"css"|"scss"|"sql"|"sh"|"env"|"ini"|"conf"
-    );
     let bytes = tokio::fs::read(p)
         .await
         .map_err(|e| format!("file read failed: {e}"))?;
-    let mut data = bytes;
+    Ok(interpret_extracted_file_bytes(&ext, title, bytes, max))
+}
+
+fn is_likely_text_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt" | "md" | "markdown" | "csv" | "tsv" | "json" | "jsonl" | "xml" | "html" | "htm"
+            | "yaml" | "yml" | "log" | "rst" | "tex" | "bib" | "srt" | "vtt" | "svg"
+            | "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "h" | "hpp"
+            | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "toml" | "css" | "scss" | "sass"
+            | "sql" | "sh" | "bash" | "zsh" | "env" | "ini" | "conf" | "cfg" | "properties"
+    )
+}
+
+fn binary_extraction_note(ext: &str) -> String {
+    // ponytail: clearer note for formats needing specialized parsers; no parser deps added.
+    match ext {
+        "pdf" => "pdf extraction pending pipeline".into(),
+        "doc" | "docx" | "odt" | "rtf" => "document extraction pending pipeline".into(),
+        "ppt" | "pptx" | "key" => "presentation extraction pending pipeline".into(),
+        "xls" | "xlsx" | "ods" => "spreadsheet extraction pending pipeline".into(),
+        "mp3" | "wav" | "m4a" | "mp4" | "mov" | "webm" | "ogg" | "flac" | "aac" => {
+            "media/transcript extraction pending pipeline".into()
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "heic" => {
+            "image/ocr extraction pending pipeline".into()
+        }
+        "" => "binary extraction pending pipeline".into(),
+        _ => format!("binary/{ext} extraction pending pipeline"),
+    }
+}
+
+fn interpret_extracted_file_bytes(
+    ext: &str,
+    title: Option<String>,
+    mut data: Vec<u8>,
+    max: usize,
+) -> (Option<String>, String, Option<String>) {
+    let likely_text = is_likely_text_ext(ext);
     let mut truncated = false;
     if data.len() > max {
         data.truncate(max);
@@ -806,14 +901,14 @@ async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option
     match String::from_utf8(data) {
         Ok(text) => {
             if !likely_text && text.trim().is_empty() {
-                return Ok((None, "file extracted but empty".into(), title));
+                return (None, "file extracted but empty".into(), title);
             }
-            let (normalized, mut note) = normalize_text_content(&text, "file", Some(&ext));
+            let (normalized, mut note) = normalize_text_content_with_max(&text, "file", Some(ext), max);
             if truncated {
                 note = format!("{note}; truncated during read");
             }
             if normalized.is_none() {
-                return Ok((
+                return (
                     None,
                     if truncated {
                         "file extracted but empty after truncation".into()
@@ -821,9 +916,9 @@ async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option
                         "file extracted but empty".into()
                     },
                     title,
-                ));
+                );
             }
-            Ok((
+            (
                 normalized,
                 if likely_text {
                     note
@@ -831,17 +926,13 @@ async fn extract_file_text(path: &str) -> Result<(Option<String>, String, Option
                     format!("{note}; decoded as text")
                 },
                 title,
-            ))
+            )
         }
-        Err(_) => Ok((
-            None,
-            format!("binary/{ext} extraction pending pipeline"),
-            title,
-        )),
+        Err(_) => (None, binary_extraction_note(ext), title),
     }
 }
 
-async fn generate_podcast_job(pool: &PgPool, input: &Value) -> Result<Value, String> {
+async fn generate_podcast_job(pool: &PgPool, job_id: Uuid, input: &Value) -> Result<Value, String> {
     let eid = input
         .get("episode_id")
         .and_then(|v| v.as_str())
@@ -898,6 +989,7 @@ async fn generate_podcast_job(pool: &PgPool, input: &Value) -> Result<Value, Str
     let outline_text = crate::providers::chat_completion(pool, outline_model.as_deref(), Some("default_chat_model"), outline_system, &outline_user)
         .await
         .map_err(|e| e.to_string())?;
+    if job_canceled(pool, job_id).await { return Err("canceled".into()); }
     let outline_json: Value = serde_json::from_str(outline_text.trim())
         .or_else(|_| extract_json_object(&outline_text))
         .unwrap_or_else(|_| json!({"segments":[{"title": name, "description": outline_text}]}));
@@ -911,6 +1003,7 @@ async fn generate_podcast_job(pool: &PgPool, input: &Value) -> Result<Value, Str
     let transcript_text = crate::providers::chat_completion(pool, transcript_model.as_deref(), Some("default_chat_model"), transcript_system, &transcript_user)
         .await
         .map_err(|e| e.to_string())?;
+    if job_canceled(pool, job_id).await { return Err("canceled".into()); }
     let transcript_json: Value = serde_json::from_str(transcript_text.trim())
         .or_else(|_| extract_json_object(&transcript_text))
         .unwrap_or_else(|_| json!({"transcript":[{"speaker":"Host","text": transcript_text}]}));
@@ -940,12 +1033,168 @@ async fn generate_podcast_job(pool: &PgPool, input: &Value) -> Result<Value, Str
 }
 
 fn extract_json_object(s: &str) -> Result<Value, serde_json::Error> {
-    if let Some(start) = s.find('{') {
-        if let Some(end) = s.rfind('}') {
+    let trimmed = s.trim();
+    // ponytail: strip common markdown code fences before parsing.
+    let candidate = if trimmed.starts_with("```") {
+        let mut lines = trimmed.lines();
+        lines.next(); // fence line (``` or ```json)
+        let mut body = String::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        body
+    } else {
+        trimmed.to_string()
+    };
+    let t = candidate.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return Ok(v);
+    }
+    if let Some(start) = t.find('{') {
+        if let Some(end) = t.rfind('}') {
             if end > start {
-                return serde_json::from_str(&s[start..=end]);
+                return serde_json::from_str(&t[start..=end]);
             }
         }
     }
-    serde_json::from_str(s)
+    serde_json::from_str(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_html_detects_common_docs() {
+        assert!(looks_like_html("<!doctype html><html></html>"));
+        assert!(looks_like_html("  <HTML><body>x</body></HTML>"));
+        assert!(looks_like_html("<html><body>hi</body></html>"));
+        assert!(!looks_like_html("plain text"));
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_scripts_and_decodes_entities() {
+        let html = "<html><head><title>Hi</title><script>alert(1)</script></head><body><h1>Hello</h1><p>A &amp; B<br>Line2</p></body></html>";
+        let t = html_to_text(html);
+        assert!(t.contains("Hello"));
+        assert!(t.contains("A & B"));
+        assert!(t.contains("Line2"));
+        assert!(!t.contains("alert"));
+        assert!(!t.contains("<h1>"));
+    }
+
+    #[test]
+    fn extract_html_title_reads_title_tag() {
+        assert_eq!(
+            extract_html_title("<html><head><title>  My Page  </title></head></html>").as_deref(),
+            Some("My Page")
+        );
+        assert!(extract_html_title("<html><body>no title</body></html>").is_none());
+    }
+
+    #[test]
+    fn normalize_text_content_strips_html_by_ext_and_trims() {
+        let (text, note) = normalize_text_content_with_max("<p>Hello</p><p>World</p>", "file", Some("html"), 10_000);
+        let text = text.unwrap();
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(note.contains("html stripped"));
+    }
+
+    #[test]
+    fn normalize_text_content_truncates_with_marker() {
+        let raw = "abcdefghij";
+        let (text, note) = normalize_text_content_with_max(raw, "direct", None, 5);
+        assert!(text.is_some());
+        assert_eq!(text.unwrap(), "abcde");
+        assert!(note.contains("truncated to 5 bytes"));
+    }
+
+    #[test]
+    fn extract_json_object_parses_plain_fenced_and_embedded() {
+        let v = extract_json_object(r#"{"a":1}"#).unwrap();
+        assert_eq!(v["a"], 1);
+        let fenced = "```json\n{\"b\":2}\n```";
+        let v2 = extract_json_object(fenced).unwrap();
+        assert_eq!(v2["b"], 2);
+        let embedded = "here you go:\n{\"c\":3}\nthanks";
+        let v3 = extract_json_object(embedded).unwrap();
+        assert_eq!(v3["c"], 3);
+    }
+
+    #[test]
+    fn interpret_extracted_file_bytes_handles_text_html_and_binary_notes() {
+        let (text, note, title) = interpret_extracted_file_bytes(
+            "txt",
+            Some("doc".into()),
+            b"hello world".to_vec(),
+            10_000,
+        );
+        assert_eq!(text.as_deref(), Some("hello world"));
+        assert_eq!(title.as_deref(), Some("doc"));
+        assert!(note.contains("file content extracted"));
+
+        let (html_text, note, _) = interpret_extracted_file_bytes(
+            "html",
+            None,
+            b"<html><body><p>Hello</p></body></html>".to_vec(),
+            10_000,
+        );
+        assert!(html_text.unwrap_or_default().contains("Hello"));
+        assert!(note.contains("html stripped"));
+
+        let (none, note, _) = interpret_extracted_file_bytes("pdf", Some("paper".into()), vec![0, 1, 2, 3, 255], 10_000);
+        assert!(none.is_none());
+        assert_eq!(note, "pdf extraction pending pipeline");
+
+        let (none, note, _) = interpret_extracted_file_bytes("docx", None, vec![0, 159, 146, 150], 10_000);
+        assert!(none.is_none());
+        assert!(note.contains("document extraction pending pipeline"));
+    }
+
+    #[test]
+    fn interpret_extracted_file_bytes_decodes_unknown_utf8_and_truncates() {
+        let (text, note, _) = interpret_extracted_file_bytes("weirdext", None, b"plain text".to_vec(), 10_000);
+        assert_eq!(text.as_deref(), Some("plain text"));
+        assert!(note.contains("decoded as text"));
+
+        let (text, note, _) = interpret_extracted_file_bytes("txt", None, b"abcdefghij".to_vec(), 5);
+        assert_eq!(text.as_deref(), Some("abcde"));
+        assert!(note.contains("truncated"));
+    }
+
+    #[test]
+    fn is_likely_text_ext_covers_common_subtitle_and_source_formats() {
+        assert!(is_likely_text_ext("srt"));
+        assert!(is_likely_text_ext("vtt"));
+        assert!(is_likely_text_ext("svg"));
+        assert!(is_likely_text_ext("tsv"));
+        assert!(!is_likely_text_ext("pdf"));
+        assert!(!is_likely_text_ext("mp4"));
+    }
+
+    #[test]
+    fn parse_job_id_accepts_plain_and_command_prefixed() {
+        let id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(parse_job_id(&id.to_string()).unwrap(), id);
+        assert_eq!(
+            parse_job_id("command:11111111-1111-1111-1111-111111111111").unwrap(),
+            id
+        );
+        assert!(parse_job_id("not-a-uuid").is_err());
+        assert!(parse_job_id("command:not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn as_command_id_formats_prefixed_identifier() {
+        let id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(
+            as_command_id(id),
+            "command:11111111-1111-1111-1111-111111111111"
+        );
+    }
 }
